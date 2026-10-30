@@ -79,6 +79,7 @@ class CameraConfig:
     performance_level: int
     camera_width: int | None = None
     camera_height: int | None = None
+    customer_min_dwell_seconds: float = 0.5
 
 
 @dataclass
@@ -522,6 +523,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
         if config
         else (CAMERA_WIDTH, CAMERA_HEIGHT, YOLO_IMGSZ, FACE_DET_SIZE, FACE_INTERVAL)
     )
+    customer_min_dwell_seconds = config.customer_min_dwell_seconds if config else CUSTOMER_MIN_DWELL_SECONDS
     if config:
         width = config.camera_width or width
         height = config.camera_height or height
@@ -741,7 +743,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
 
                 # After grace period, resolve observing track into either Staff (via body/Vision AI) or Unique Daily Customer
                 dwell = now - float(entry.get("first_seen", now))
-                if entry.get("kind") == "observing" and dwell >= CUSTOMER_MIN_DWELL_SECONDS:
+                if entry.get("kind") == "observing" and dwell >= customer_min_dwell_seconds:
                     staff_body_match = match_staff_body(entry.get("body_vector"), staff_body_cache, now)  # type: ignore[arg-type]
                     if staff_body_match is not None and entry.get("face_vector") is None:
                         emp_matched, b_score = staff_body_match

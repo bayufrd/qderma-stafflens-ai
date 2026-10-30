@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from dotenv import load_dotenv
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, inspect, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
@@ -101,11 +101,17 @@ class CameraSettings(Base):
     performance_level: Mapped[int] = mapped_column(Integer, default=5)
     camera_width: Mapped[int | None] = mapped_column(Integer, nullable=True)
     camera_height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    customer_min_dwell_seconds: Mapped[float] = mapped_column(Float, default=0.5)
+
 
 
 def initialize_database() -> None:
     Base.metadata.create_all(bind=engine)
-
+    # Lightweight migration for installations created before dwell-time setting existed.
+    with engine.begin() as connection:
+        columns = {column["name"] for column in inspect(engine).get_columns("camera_settings")}
+        if "customer_min_dwell_seconds" not in columns:
+            connection.execute(text("ALTER TABLE camera_settings ADD COLUMN customer_min_dwell_seconds FLOAT DEFAULT 0.5"))
 
 if __name__ == "__main__":
     initialize_database()

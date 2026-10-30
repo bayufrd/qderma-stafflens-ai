@@ -10,7 +10,13 @@ const busy = ref(false)
 const page = ref('Ringkasan')
 const activityTab = ref('visitors')
 const eventFilter = ref('all')
-const settings = ref({ video_source: 0, performance_level: 5, camera_width: null, camera_height: null })
+const settings = ref({
+  video_source: 0,
+  performance_level: 5,
+  camera_width: null,
+  camera_height: null,
+  customer_min_dwell_seconds: 0.5,
+})
 const resources = ref(null)
 const settingsNotice = ref('')
 const overview = ref({
@@ -280,6 +286,7 @@ async function saveSettings() {
           settings.value.camera_height === '' || settings.value.camera_height == null
             ? null
             : Number(settings.value.camera_height),
+        customer_min_dwell_seconds: Number(settings.value.customer_min_dwell_seconds),
       }),
     })
     settings.value = result.settings
@@ -1056,6 +1063,17 @@ onUnmounted(() => {
                   max="1080"
                   placeholder="Ikuti preset"
                 />
+                <label for="dwell">Durasi minimum customer (detik)</label>
+                <input
+                  id="dwell"
+                  v-model.number="settings.customer_min_dwell_seconds"
+                  type="number"
+                  min="0.1"
+                  max="10"
+                  step="0.1"
+                  required
+                />
+                <small>0,5 dtk direkomendasikan untuk orang yang hanya melintas.</small>
                 <button class="button primary" type="submit" :disabled="busy">
                   {{ busy ? 'Menerapkan…' : 'Simpan & terapkan' }} <span aria-hidden="true">→</span>
                 </button>

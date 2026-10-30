@@ -198,6 +198,7 @@ class CameraSettingsBody(BaseModel):
     performance_level: int = Field(ge=1, le=5)
     camera_width: int | None = Field(default=None, ge=160, le=1920)
     camera_height: int | None = Field(default=None, ge=120, le=1080)
+    customer_min_dwell_seconds: float = Field(default=0.5, ge=0.1, le=10)
 
 
 class PhotoUploadItem(BaseModel):
@@ -270,6 +271,7 @@ def _settings() -> CameraSettingsBody:
             return CameraSettingsBody(
                 video_source=int(os.getenv("VIDEO_SOURCE", "0")) if os.getenv("VIDEO_SOURCE", "0").isdigit() else 0,
                 performance_level=int(os.getenv("PERFORMANCE_LEVEL", "1")),
+                customer_min_dwell_seconds=0.5,
             )
         return CameraSettingsBody.model_validate(
             {
@@ -277,6 +279,7 @@ def _settings() -> CameraSettingsBody:
                 "performance_level": row.performance_level,
                 "camera_width": row.camera_width,
                 "camera_height": row.camera_height,
+                "customer_min_dwell_seconds": row.customer_min_dwell_seconds,
             }
         )
 
