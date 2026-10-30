@@ -19,6 +19,7 @@ frontend/node_modules/
 frontend/dist/
 .taste-skill/
 .agents/
+.arena/
 db_karyawan
 docs
 frontend/dist

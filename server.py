@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hmac
+import logging
 import os
 import platform
 import re
@@ -45,6 +46,20 @@ DB_KARYAWAN_DIR = ROOT_DIR / "db_karyawan"
 ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 app = FastAPI(title="StaffLens AI", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+class _SuppressFramePollFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/api/camera/frame" not in record.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(_SuppressFramePollFilter())
+
+
+@app.on_event("startup")
+def _install_log_filter() -> None:
+    logging.getLogger("uvicorn.access").addFilter(_SuppressFramePollFilter())
+
 
 # One process/one camera. Run uvicorn with a single worker; no public network binding.
 _state_lock = threading.Lock()

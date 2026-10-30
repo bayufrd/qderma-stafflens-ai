@@ -40,10 +40,139 @@ const camera = ref({
 const dataError = ref('')
 const lastUpdated = ref(null)
 const frameUrl = ref('')
-let streamId = 0
+const cameraImgRef = ref(null)
+let frameLoopToken = 0
+let streamRunning = false
+let currentBlobUrl = ''
+let frameAbortController = null
+let streamGeneration = 0
 const search = ref('')
 let timer
 let resourcesTimer
+
+function findHeaderEnd(buf) {
+  for (let i = 0; i <= buf.length - 4; i++) {
+    if (buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10) {
+      return i
+    }
+  }
+  return -1
+}
+
+function concatUint8(a, b) {
+  if (!a || a.length === 0) return b
+  const out = new Uint8Array(a.length + b.length)
+  out.set(a, 0)
+  out.set(b, a.length)
+  return out
+}
+
+function disconnectStream() {
+  frameLoopToken++
+  streamRunning = false
+  if (frameAbortController) {
+    try {
+      frameAbortController.abort()
+    } catch (_) {
+      /* ignore abort error */
+    }
+    frameAbortController = null
+  }
+  if (currentBlobUrl) {
+    URL.revokeObjectURL(currentBlobUrl)
+    currentBlobUrl = ''
+  }
+  frameUrl.value = ''
+  streamGeneration = 0
+}
+
+function connectStream(gen = 0) {
+  streamGeneration = gen || streamGeneration || 1
+  if (streamRunning) return
+  streamRunning = true
+  const myToken = ++frameLoopToken
+
+  ;(async () => {
+    const decoder = new TextDecoder()
+    while (
+      myToken === frameLoopToken &&
+      authenticated.value &&
+      page.value === 'Ringkasan' &&
+      camera.value.running
+    ) {
+      const controller = new AbortController()
+      frameAbortController = controller
+      try {
+        const res = await fetch(`/api/camera/stream?session=${Date.now()}-${myToken}`, {
+          credentials: 'same-origin',
+          cache: 'no-store',
+          signal: controller.signal,
+        })
+        if (myToken !== frameLoopToken || !res.ok || !res.body) {
+          await new Promise(resolve => setTimeout(resolve, 600))
+          continue
+        }
+        const reader = res.body.getReader()
+        let buffer = new Uint8Array(0)
+        while (myToken === frameLoopToken) {
+          const { value, done } = await reader.read()
+          if (done || myToken !== frameLoopToken) break
+          if (value && value.length) {
+            buffer = concatUint8(buffer, value)
+            let latestJpeg = null
+            while (true) {
+              const headerEnd = findHeaderEnd(buffer)
+              if (headerEnd === -1) break
+              const headerText = decoder.decode(buffer.subarray(0, headerEnd))
+              const match = headerText.match(/Content-Length:\s*(\d+)/i)
+              if (!match) {
+                buffer = buffer.slice(headerEnd + 4)
+                continue
+              }
+              const contentLength = Number(match[1])
+              const bodyStart = headerEnd + 4
+              const bodyEnd = bodyStart + contentLength
+              if (buffer.length < bodyEnd) break
+              latestJpeg = buffer.slice(bodyStart, bodyEnd)
+              let nextOffset = bodyEnd
+              if (buffer[nextOffset] === 13 && buffer[nextOffset + 1] === 10) {
+                nextOffset += 2
+              }
+              buffer = buffer.slice(nextOffset)
+            }
+            if (latestJpeg) {
+              const nextUrl = URL.createObjectURL(new Blob([latestJpeg], { type: 'image/jpeg' }))
+              const prevUrl = currentBlobUrl
+              currentBlobUrl = nextUrl
+              frameUrl.value = nextUrl
+              if (prevUrl) URL.revokeObjectURL(prevUrl)
+            }
+          }
+        }
+      } catch (_) {
+        /* reconnect if stream was interrupted */
+      }
+      if (myToken === frameLoopToken) {
+        await new Promise(resolve => setTimeout(resolve, 500))
+      }
+    }
+    if (myToken === frameLoopToken) {
+      streamRunning = false
+    }
+  })()
+}
+
+function selectPage(targetPage) {
+  if (page.value === targetPage) return
+  if (page.value === 'Ringkasan' && targetPage !== 'Ringkasan') {
+    disconnectStream()
+  }
+  page.value = targetPage
+  search.value = ''
+  if (targetPage === 'Ringkasan' && camera.value.running && camera.value.has_frame) {
+    connectStream(camera.value.generation)
+  }
+}
 
 // Employee Modal & Photo Upload State
 const showEmployeeModal = ref(false)
@@ -81,7 +210,7 @@ async function api(path, options = {}) {
   return response.json()
 }
 
-async function refresh() {
+async function refresh(forceStream = false) {
   if (!authenticated.value) return
   try {
     const [summary, visitorData, eventData, employeeData, cameraData] = await Promise.all([
@@ -96,11 +225,21 @@ async function refresh() {
     events.value = eventData.items || []
     employees.value = employeeData.items || []
     camera.value = cameraData
-    if (!cameraData.running) frameUrl.value = ''
-    else if (cameraData.has_frame && !frameUrl.value) frameUrl.value = `/api/camera/stream?session=${++streamId}`
+    if (!cameraData.running || !cameraData.has_frame || page.value !== 'Ringkasan') {
+      if (frameUrl.value || streamRunning) disconnectStream()
+    } else if (
+      forceStream === true ||
+      !streamRunning ||
+      !frameUrl.value ||
+      (cameraData.generation && cameraData.generation !== streamGeneration)
+    ) {
+      if (forceStream === true) disconnectStream()
+      connectStream(cameraData.generation)
+    }
     lastUpdated.value = new Date()
     dataError.value = ''
   } catch (error) {
+    disconnectStream()
     dataError.value = error.message
   }
 }
@@ -332,7 +471,7 @@ async function login() {
 }
 
 async function logout() {
-  frameUrl.value = ''
+  disconnectStream()
   authenticated.value = false
   stopPolling()
   try {
@@ -345,9 +484,15 @@ async function logout() {
 async function toggleCamera() {
   busy.value = true
   try {
-    if (camera.value.running) frameUrl.value = ''
-    await api(camera.value.running ? '/camera/stop' : '/camera/start', { method: 'POST' })
-    await refresh()
+    const wasRunning = camera.value.running
+    disconnectStream()
+    await api(wasRunning ? '/camera/stop' : '/camera/start', { method: 'POST' })
+    await refresh(true)
+    if (!wasRunning) {
+      setTimeout(() => refresh(), 700)
+      setTimeout(() => refresh(), 1500)
+      setTimeout(() => refresh(), 2400)
+    }
   } catch (error) {
     dataError.value = error.message
   } finally {
@@ -424,7 +569,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopPolling()
-  frameUrl.value = ''
+  disconnectStream()
 })
 </script>
 
@@ -478,7 +623,7 @@ onUnmounted(() => {
           :key="item"
           class="nav-item"
           :class="{ selected: page === item }"
-          @click="page = item; search = ''"
+          @click="selectPage(item)"
         >
           <span>{{ item }}</span>
           <span v-if="item === 'Customer'" class="nav-count">{{ overview.customers_today }}</span>
@@ -510,7 +655,7 @@ onUnmounted(() => {
           v-for="item in navItems"
           :key="item"
           :class="{ selected: page === item }"
-          @click="page = item; search = ''"
+          @click="selectPage(item)"
         >
           {{ item }}
         </button>
@@ -528,7 +673,7 @@ onUnmounted(() => {
             <button v-if="page === 'Pegawai'" class="button primary" @click="openEmployeeModal(null)">
               + Tambah pegawai
             </button>
-            <button class="button secondary" @click="refresh">
+            <button class="button secondary" @click="refresh(true)">
               Perbarui data <span aria-hidden="true">↗</span>
             </button>
           </div>
@@ -536,7 +681,7 @@ onUnmounted(() => {
 
         <p v-if="dataError" class="error-notice" role="alert">
           {{ dataError }}
-          <button class="text-button" @click="refresh">Coba lagi</button>
+          <button class="text-button" @click="refresh(true)">Coba lagi</button>
         </p>
 
         <template v-if="page === 'Ringkasan'">
@@ -596,9 +741,10 @@ onUnmounted(() => {
               <div class="camera-stage">
                 <img
                   v-if="frameUrl"
+                  ref="cameraImgRef"
                   :src="frameUrl"
                   alt="Pratinjau kamera teranotasi"
-                  @error="frameUrl = ''"
+                  @error="disconnectStream()"
                 />
                 <div v-else class="camera-empty">
                   <div class="viewfinder" aria-hidden="true"><span></span></div>
@@ -662,7 +808,7 @@ onUnmounted(() => {
                   dan tidak dimasukkan ke hitungan customer.
                 </p>
               </div>
-              <button class="text-button" @click="page = 'Pegawai'">
+              <button class="text-button" @click="selectPage('Pegawai')">
                 Kelola pegawai <span aria-hidden="true">→</span>
               </button>
             </div>
@@ -703,7 +849,7 @@ onUnmounted(() => {
                 <h2>Customer unik terbaru hari ini</h2>
                 <p>Setiap pengunjung baru dicatat satu kali per hari beserta jumlah kunjungan ulangnya.</p>
               </div>
-              <button class="text-button" @click="page = 'Customer'">
+              <button class="text-button" @click="selectPage('Customer')">
                 Lihat semua ({{ overview.customers_today }}) <span aria-hidden="true">→</span>
               </button>
             </div>
