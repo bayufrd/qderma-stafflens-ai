@@ -1,0 +1,26 @@
+# Local secrets and runtime data
+.env
+.venv/
+__pycache__/
+*.py[cod]
+
+# Biometric references and generated media
+db_karyawan/
+data/
+events/
+
+# Model artifacts
+*.onnx
+*.engine
+*.pt
+
+# Frontend dependencies, build and design inspection artifacts
+frontend/node_modules/
+frontend/dist/
+.taste-skill/
+.agents/
+db_karyawan
+docs
+frontend/dist
+frontend/node_modules
+.roo
