@@ -30,6 +30,11 @@ class Employee(Base):
     name: Mapped[str] = mapped_column(String(255), index=True)
     role: Mapped[str] = mapped_column(String(100), default="Karyawan")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # SatuSehat: NIK is stored encrypted (reversible, needed for Practitioner lookup); only last 4 digits in clear.
+    nik_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    nik_last4: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    satusehat_practitioner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    satusehat_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     embeddings: Mapped[list["FaceEmbedding"]] = relationship(back_populates="employee", cascade="all, delete-orphan")
 
@@ -105,6 +110,47 @@ class CameraSettings(Base):
 
 
 
+class SatuSehatSettings(Base):
+    """Single-row SatuSehat integration settings. client_secret is stored encrypted (Fernet)."""
+
+    __tablename__ = "satusehat_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    env: Mapped[str] = mapped_column(String(16), default="dev")
+    client_id: Mapped[str] = mapped_column(String(255), default="")
+    organization_id: Mapped[str] = mapped_column(String(64), default="")
+    client_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    location_name: Mapped[str] = mapped_column(String(255), default="")
+    location_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    location_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_test_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_test_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    last_test_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+# Columns added after the first release; create_all() does not alter existing tables.
+_EMPLOYEE_NEW_COLUMNS = {
+    "nik_encrypted": "TEXT",
+    "nik_last4": "VARCHAR(4)",
+    "satusehat_practitioner_id": "VARCHAR(64)",
+    "satusehat_synced_at": "TIMESTAMP WITH TIME ZONE",
+}
+
+
+def _migrate_employee_columns() -> None:
+    existing = {col["name"] for col in inspect(engine).get_columns("employees")}
+    missing = {name: ddl for name, ddl in _EMPLOYEE_NEW_COLUMNS.items() if name not in existing}
+    if not missing:
+        return
+    is_mysql = engine.dialect.name == "mysql"
+    with engine.begin() as conn:
+        for name, ddl in missing.items():
+            if is_mysql and ddl.startswith("TIMESTAMP"):
+                ddl = "DATETIME"
+            conn.execute(text(f"ALTER TABLE employees ADD COLUMN {name} {ddl}"))
+
+
 def initialize_database() -> None:
     Base.metadata.create_all(bind=engine)
     # Lightweight migration for installations created before dwell-time setting existed.
@@ -112,6 +158,8 @@ def initialize_database() -> None:
         columns = {column["name"] for column in inspect(engine).get_columns("camera_settings")}
         if "customer_min_dwell_seconds" not in columns:
             connection.execute(text("ALTER TABLE camera_settings ADD COLUMN customer_min_dwell_seconds FLOAT DEFAULT 0.5"))
+    _migrate_employee_columns()
+
 
 if __name__ == "__main__":
     initialize_database()

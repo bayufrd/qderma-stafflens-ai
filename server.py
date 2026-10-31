@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hmac
+import json
 import logging
 import os
 import platform
@@ -16,22 +17,26 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-
+from typing import Literal
 import cv2
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
+import satusehat
 from database import (
+    AuditLog,
     CameraEvent,
     CameraSettings,
     DailyVisitor,
     Employee,
     FaceEmbedding,
+    SatuSehatSettings,
     SessionLocal,
     initialize_database,
 )
@@ -48,17 +53,49 @@ ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 app = FastAPI(title="StaffLens AI", docs_url=None, redoc_url=None, openapi_url=None)
 
 
+_QUIET_POLL_PATHS = (
+    '"GET /api/auth/session',
+    '"GET /api/camera/frame',
+    '"GET /api/camera/status',
+    '"GET /api/dashboard',
+    '"GET /api/overview',
+    '"GET /api/visitors',
+    '"GET /api/events',
+    '"GET /api/employees ',
+    '"GET /api/system/resources',
+)
+
+
 class _SuppressFramePollFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        return "/api/camera/frame" not in record.getMessage()
+        if record.levelno >= logging.WARNING:
+            return True
+        msg = record.getMessage()
+        if "/api/camera/frame" in msg or "/api/camera/ws" in msg:
+            return False
+        if msg in ("connection open", "connection closed"):
+            return False
+        if msg.endswith(" 200") and any(p in msg for p in _QUIET_POLL_PATHS):
+            return False
+        return True
 
 
-logging.getLogger("uvicorn.access").addFilter(_SuppressFramePollFilter())
+_log_filter = _SuppressFramePollFilter()
+
+
+def _attach_log_filter() -> None:
+    for logger_name in ("uvicorn.access", "uvicorn.error"):
+        lg = logging.getLogger(logger_name)
+        if not any(isinstance(f, _SuppressFramePollFilter) for f in lg.filters):
+            lg.addFilter(_log_filter)
+
+
+_attach_log_filter()
 
 
 @app.on_event("startup")
 def _install_log_filter() -> None:
-    logging.getLogger("uvicorn.access").addFilter(_SuppressFramePollFilter())
+    _attach_log_filter()
 
 
 # One process/one camera. Run uvicorn with a single worker; no public network binding.
@@ -81,6 +118,34 @@ _resource_lock = threading.Lock()
 _CPU_MODEL_NAME: str | None = None
 _face_lock = threading.Lock()
 _face_analyzer = None
+_restarting = False
+_db_ready = False
+_db_init_lock = threading.Lock()
+_ws_waiters: dict[asyncio.Event, tuple[asyncio.AbstractEventLoop, dict[str, object]]] = {}
+
+
+def _ensure_db() -> None:
+    global _db_ready
+    if _db_ready:
+        return
+    with _db_init_lock:
+        if not _db_ready:
+            initialize_database()
+            _db_ready = True
+
+
+def _notify_ws_waiters(frame_only: bool = False) -> None:
+    # Caller must hold _state_lock / _frame_ready.
+    dead: list[asyncio.Event] = []
+    for ev, (loop, state) in list(_ws_waiters.items()):
+        if frame_only and not state.get("subscribe_frames", False):
+            continue
+        try:
+            loop.call_soon_threadsafe(ev.set)
+        except RuntimeError:
+            dead.append(ev)
+    for ev in dead:
+        _ws_waiters.pop(ev, None)
 
 
 def _get_cpu_model_name() -> str:
@@ -211,9 +276,18 @@ class EmployeeSaveBody(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     role: str = Field(default="Karyawan", min_length=1, max_length=100)
     active: bool = True
+    nik: str | None = Field(default=None, max_length=32)  # None = keep, "" = clear, 16 digits = set
     new_photos: list[PhotoUploadItem] = Field(default_factory=list)
     delete_photos: list[str] = Field(default_factory=list)
     reprocess_embeddings: bool = False
+
+
+class SatuSehatSettingsBody(BaseModel):
+    env: Literal["dev", "staging", "production"]
+    client_id: str = Field(default="", max_length=255)
+    organization_id: str = Field(default="", max_length=64)
+    client_secret: str | None = Field(default=None, max_length=512)  # None/"" = keep the stored secret
+    location_name: str = Field(default="", max_length=255)
 
 
 def _today_bounds_utc() -> tuple[datetime, datetime]:
@@ -240,7 +314,7 @@ def _password() -> str:
     return value
 
 
-def _authenticated(request: Request) -> bool:
+def _authenticated(request: Request | WebSocket) -> bool:
     token = request.cookies.get(COOKIE_NAME, "")
     with _state_lock:
         expiry = _session_tokens.get(token, 0) if token else 0
@@ -263,8 +337,16 @@ def require_same_origin(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Invalid origin")
 
 
+def _ws_same_origin(websocket: WebSocket) -> bool:
+    origin = (websocket.headers.get("origin") or "").rstrip("/")
+    host = (websocket.headers.get("host") or "").strip()
+    if not origin or not host:
+        return False
+    return origin in {f"http://{host}", f"https://{host}"}
+
+
 def _settings() -> CameraSettingsBody:
-    initialize_database()
+    _ensure_db()
     with SessionLocal() as db:
         row = db.get(CameraSettings, 1)
         if row is None:
@@ -298,10 +380,11 @@ def _start_worker(config: CameraSettingsBody) -> None:
         _worker = threading.Thread(target=_worker_main, args=(config, _stop), daemon=True, name="stafflens-camera")
         _worker.start()
         _frame_ready.notify_all()
+        _notify_ws_waiters()
 
 
 def _worker_main(config: CameraSettingsBody, stop_event: threading.Event) -> None:
-    global _error, _frame, _fps, _frame_version, _live_counts
+    global _worker, _error, _frame, _fps, _frame_version, _live_counts
     try:
         if stop_event.is_set():
             return
@@ -310,12 +393,15 @@ def _worker_main(config: CameraSettingsBody, stop_event: threading.Event) -> Non
         def on_frame(image, fps: float, live_counts: dict[str, int] | None = None) -> None:
             global _frame, _fps, _frame_version, _live_counts
             # At most 8 preview JPEGs/s; inference and encoding happen once per camera.
-            if time.monotonic() - getattr(on_frame, "last", 0) < 0.125:
+            now_mono = time.monotonic()
+            if now_mono - getattr(on_frame, "last", 0.0) < 0.125:
                 return
-            on_frame.last = time.monotonic()
+            on_frame.last = now_mono
             ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 65])
             if ok:
                 with _frame_ready:
+                    had_frame = _frame is not None
+                    prev_counts = _live_counts.copy()
                     _frame = encoded.tobytes()
                     _fps = round(fps, 1)
                     if live_counts is not None:
@@ -325,7 +411,16 @@ def _worker_main(config: CameraSettingsBody, stop_event: threading.Event) -> Non
                             "observing": int(live_counts.get("observing", 0)),
                         }
                     _frame_version += 1
+                    fps_milestone = (
+                        abs(_fps - getattr(on_frame, "last_status_fps", -10.0)) >= 0.2
+                        and (now_mono - getattr(on_frame, "last_fps_at", 0.0)) >= 2.0
+                    )
+                    if fps_milestone or not had_frame:
+                        on_frame.last_status_fps = _fps
+                        on_frame.last_fps_at = now_mono
+                    status_changed = (not had_frame) or (_live_counts != prev_counts) or fps_milestone
                     _frame_ready.notify_all()
+                    _notify_ws_waiters(frame_only=not status_changed)
 
         if not stop_event.is_set():
             main(stop_event=stop_event, on_frame=on_frame, show_window=False, config=CameraConfig(**config.model_dump()))
@@ -334,10 +429,14 @@ def _worker_main(config: CameraSettingsBody, stop_event: threading.Event) -> Non
             _error = str(exc)
     finally:
         with _frame_ready:
+            stop_event.set()
+            if _worker is threading.current_thread():
+                _worker = None
             _frame = None
             _fps = 0.0
             _live_counts = {"staff": 0, "customers": 0, "observing": 0}
             _frame_ready.notify_all()
+            _notify_ws_waiters()
 
 
 @app.post("/api/auth/login")
@@ -384,67 +483,65 @@ def logout(request: Request) -> Response:
     token = request.cookies.get(COOKIE_NAME, "")
     with _state_lock:
         _session_tokens.pop(token, None)
+        _notify_ws_waiters()
     response = JSONResponse({"authenticated": False}, headers={"Cache-Control": "no-store"})
     response.delete_cookie(COOKIE_NAME, path="/")
     return response
 
 
-@app.get("/api/overview", dependencies=[Depends(require_auth)])
-def overview() -> dict:
-    initialize_database()
+def _query_overview(db: Session) -> dict:
     today_date = datetime.now().astimezone().date()
     start_utc, _ = _today_bounds_utc()
 
-    with SessionLocal() as db:
-        employees_count = db.scalar(select(func.count(Employee.id)).where(Employee.active.is_(True))) or 0
-        embeddings = db.scalar(select(func.count(FaceEmbedding.id))) or 0
-        events_count = db.scalar(select(func.count(CameraEvent.id))) or 0
-        events_today = (
-            db.scalar(select(func.count(CameraEvent.id)).where(CameraEvent.created_at >= start_utc)) or 0
-        )
+    employees_count = db.scalar(select(func.count(Employee.id)).where(Employee.active.is_(True))) or 0
+    embeddings = db.scalar(select(func.count(FaceEmbedding.id))) or 0
+    events_count = db.scalar(select(func.count(CameraEvent.id))) or 0
+    events_today = (
+        db.scalar(select(func.count(CameraEvent.id)).where(CameraEvent.created_at >= start_utc)) or 0
+    )
 
-        # Unique daily customers (excluding any row reclassified as an employee)
-        customers_today = (
-            db.scalar(
-                select(func.count(DailyVisitor.id)).where(
-                    DailyVisitor.visit_date == today_date,
-                    DailyVisitor.reclassified_employee_id.is_(None),
-                )
+    # Unique daily customers (excluding any row reclassified as an employee)
+    customers_today = (
+        db.scalar(
+            select(func.count(DailyVisitor.id)).where(
+                DailyVisitor.visit_date == today_date,
+                DailyVisitor.reclassified_employee_id.is_(None),
             )
-            or 0
         )
-        returning_customers_today = (
-            db.scalar(
-                select(func.count(DailyVisitor.id)).where(
-                    DailyVisitor.visit_date == today_date,
-                    DailyVisitor.reclassified_employee_id.is_(None),
-                    DailyVisitor.visit_count > 1,
-                )
+        or 0
+    )
+    returning_customers_today = (
+        db.scalar(
+            select(func.count(DailyVisitor.id)).where(
+                DailyVisitor.visit_date == today_date,
+                DailyVisitor.reclassified_employee_id.is_(None),
+                DailyVisitor.visit_count > 1,
             )
-            or 0
         )
-        total_customer_visits_today = (
-            db.scalar(
-                select(func.coalesce(func.sum(DailyVisitor.visit_count), 0)).where(
-                    DailyVisitor.visit_date == today_date,
-                    DailyVisitor.reclassified_employee_id.is_(None),
-                )
+        or 0
+    )
+    total_customer_visits_today = (
+        db.scalar(
+            select(func.coalesce(func.sum(DailyVisitor.visit_count), 0)).where(
+                DailyVisitor.visit_date == today_date,
+                DailyVisitor.reclassified_employee_id.is_(None),
             )
-            or 0
         )
+        or 0
+    )
 
-        # Distinct active employees detected today
-        staff_present_today = (
-            db.scalar(
-                select(func.count(func.distinct(CameraEvent.employee_id)))
-                .join(Employee, Employee.id == CameraEvent.employee_id)
-                .where(
-                    Employee.active.is_(True),
-                    CameraEvent.created_at >= start_utc,
-                )
+    # Distinct active employees detected today
+    staff_present_today = (
+        db.scalar(
+            select(func.count(func.distinct(CameraEvent.employee_id)))
+            .join(Employee, Employee.id == CameraEvent.employee_id)
+            .where(
+                Employee.active.is_(True),
+                CameraEvent.created_at >= start_utc,
             )
-            or 0
         )
+        or 0
+    )
 
     vision = _vision_ai_status()
     return {
@@ -462,122 +559,151 @@ def overview() -> dict:
     }
 
 
+def _query_visitors(db: Session, limit: int = 50) -> dict:
+    today_date = datetime.now().astimezone().date()
+    rows = db.scalars(
+        select(DailyVisitor)
+        .where(
+            DailyVisitor.visit_date == today_date,
+            DailyVisitor.reclassified_employee_id.is_(None),
+        )
+        .order_by(DailyVisitor.last_seen_at.desc(), DailyVisitor.id.desc())
+        .limit(max(1, min(limit, 200)))
+    ).all()
+    items = []
+    for row in rows:
+        suffix = row.visitor_code.rsplit("-", 1)[-1]
+        items.append(
+            {
+                "id": row.id,
+                "code": row.visitor_code,
+                "label": f"Customer #{suffix}",
+                "visit_count": row.visit_count,
+                "first_seen_at": row.first_seen_at.isoformat(),
+                "last_seen_at": row.last_seen_at.isoformat(),
+                "has_face": row.face_vector is not None,
+                "attributes": row.attributes_summary or ("Wajah + Pakaian" if row.face_vector else "Pola Pakaian"),
+                "confidence": row.confidence,
+            }
+        )
+    return {"items": items, "date": today_date.isoformat()}
+
+
+def _query_events(db: Session, limit: int = 50) -> dict:
+    rows = db.scalars(
+        select(CameraEvent)
+        .order_by(CameraEvent.created_at.desc(), CameraEvent.id.desc())
+        .limit(max(1, min(limit, 100)))
+    ).all()
+    items = []
+    for row in rows:
+        meta = row.metadata_json or {}
+        is_staff = row.employee_id is not None or row.event_type == "identity_locked" or meta.get("kind") == "staff"
+        items.append(
+            {
+                "id": row.id,
+                "camera_id": row.camera_id,
+                "track_id": row.track_id,
+                "employee_id": row.employee_id,
+                "label": row.label,
+                "confidence": row.confidence,
+                "created_at": row.created_at.isoformat(),
+                "event_type": row.event_type,
+                "kind": "staff" if is_staff else "customer",
+                "visit_count": meta.get("visit_count", 1),
+                "visitor_code": meta.get("visitor_code"),
+            }
+        )
+    return {"items": items}
+
+
+def _employee_satusehat_fields(employee: Employee) -> dict:
+    return {
+        "has_nik": bool(employee.nik_encrypted),
+        "nik_masked": f"{'•' * 12}{employee.nik_last4}" if employee.nik_last4 else None,
+        "satusehat_practitioner_id": employee.satusehat_practitioner_id,
+        "satusehat_synced_at": employee.satusehat_synced_at.isoformat() if employee.satusehat_synced_at else None,
+    }
+
+
+def _query_employees(db: Session) -> dict:
+    start_utc, _ = _today_bounds_utc()
+    rows = db.execute(
+        select(Employee, func.count(FaceEmbedding.id))
+        .outerjoin(FaceEmbedding)
+        .group_by(Employee.id)
+        .order_by(Employee.name)
+    ).all()
+
+    today_map: dict[int, tuple[int, datetime | None]] = {}
+    presence_rows = db.execute(
+        select(
+            CameraEvent.employee_id,
+            func.count(CameraEvent.id),
+            func.max(CameraEvent.created_at),
+        )
+        .where(CameraEvent.employee_id.is_not(None), CameraEvent.created_at >= start_utc)
+        .group_by(CameraEvent.employee_id)
+    ).all()
+    for emp_id, det_count, last_seen in presence_rows:
+        if emp_id is not None:
+            today_map[int(emp_id)] = (int(det_count), last_seen)
+
+    items = []
+    for employee, emb_count in rows:
+        det_today, last_seen_dt = today_map.get(employee.id, (0, None))
+        folder = _resolve_employee_folder(employee.employee_code, employee.name)
+        photos = _list_folder_photos(folder)
+        items.append(
+            {
+                "id": employee.id,
+                "code": employee.employee_code,
+                "name": employee.name,
+                "role": employee.role,
+                "active": employee.active,
+                "embeddings": emb_count,
+                "folder": f"db_karyawan/{folder.name}",
+                "photo_count": len(photos),
+                "present_today": det_today > 0,
+                "detections_today": det_today,
+                "last_seen_today": last_seen_dt.isoformat() if last_seen_dt else None,
+                **_employee_satusehat_fields(employee),
+            }
+        )
+    return {"items": items}
+
+
+@app.get("/api/overview", dependencies=[Depends(require_auth)])
+def overview() -> dict:
+    _ensure_db()
+    with SessionLocal() as db:
+        return _query_overview(db)
+
+
 @app.get("/api/visitors", dependencies=[Depends(require_auth)])
 def visitors(limit: int = 50) -> dict:
-    initialize_database()
-    today_date = datetime.now().astimezone().date()
+    _ensure_db()
     with SessionLocal() as db:
-        rows = db.scalars(
-            select(DailyVisitor)
-            .where(
-                DailyVisitor.visit_date == today_date,
-                DailyVisitor.reclassified_employee_id.is_(None),
-            )
-            .order_by(DailyVisitor.last_seen_at.desc(), DailyVisitor.id.desc())
-            .limit(max(1, min(limit, 200)))
-        ).all()
-        items = []
-        for row in rows:
-            suffix = row.visitor_code.rsplit("-", 1)[-1]
-            items.append(
-                {
-                    "id": row.id,
-                    "code": row.visitor_code,
-                    "label": f"Customer #{suffix}",
-                    "visit_count": row.visit_count,
-                    "first_seen_at": row.first_seen_at.isoformat(),
-                    "last_seen_at": row.last_seen_at.isoformat(),
-                    "has_face": row.face_vector is not None,
-                    "attributes": row.attributes_summary or ("Wajah + Pakaian" if row.face_vector else "Pola Pakaian"),
-                    "confidence": row.confidence,
-                }
-            )
-        return {"items": items, "date": today_date.isoformat()}
+        return _query_visitors(db, limit=limit)
 
 
 @app.get("/api/events", dependencies=[Depends(require_auth)])
 def events(limit: int = 50) -> dict:
-    initialize_database()
+    _ensure_db()
     with SessionLocal() as db:
-        rows = db.scalars(
-            select(CameraEvent)
-            .order_by(CameraEvent.created_at.desc(), CameraEvent.id.desc())
-            .limit(max(1, min(limit, 100)))
-        ).all()
-        items = []
-        for row in rows:
-            meta = row.metadata_json or {}
-            is_staff = row.employee_id is not None or row.event_type == "identity_locked" or meta.get("kind") == "staff"
-            items.append(
-                {
-                    "id": row.id,
-                    "camera_id": row.camera_id,
-                    "track_id": row.track_id,
-                    "employee_id": row.employee_id,
-                    "label": row.label,
-                    "confidence": row.confidence,
-                    "created_at": row.created_at.isoformat(),
-                    "event_type": row.event_type,
-                    "kind": "staff" if is_staff else "customer",
-                    "visit_count": meta.get("visit_count", 1),
-                    "visitor_code": meta.get("visitor_code"),
-                }
-            )
-        return {"items": items}
+        return _query_events(db, limit=limit)
 
 
 @app.get("/api/employees", dependencies=[Depends(require_auth)])
 def employees() -> dict:
-    initialize_database()
-    start_utc, _ = _today_bounds_utc()
+    _ensure_db()
     with SessionLocal() as db:
-        rows = db.execute(
-            select(Employee, func.count(FaceEmbedding.id))
-            .outerjoin(FaceEmbedding)
-            .group_by(Employee.id)
-            .order_by(Employee.name)
-        ).all()
-
-        today_map: dict[int, tuple[int, datetime | None]] = {}
-        presence_rows = db.execute(
-            select(
-                CameraEvent.employee_id,
-                func.count(CameraEvent.id),
-                func.max(CameraEvent.created_at),
-            )
-            .where(CameraEvent.employee_id.is_not(None), CameraEvent.created_at >= start_utc)
-            .group_by(CameraEvent.employee_id)
-        ).all()
-        for emp_id, det_count, last_seen in presence_rows:
-            if emp_id is not None:
-                today_map[int(emp_id)] = (int(det_count), last_seen)
-
-        items = []
-        for employee, emb_count in rows:
-            det_today, last_seen_dt = today_map.get(employee.id, (0, None))
-            folder = _resolve_employee_folder(employee.employee_code, employee.name)
-            photos = _list_folder_photos(folder)
-            items.append(
-                {
-                    "id": employee.id,
-                    "code": employee.employee_code,
-                    "name": employee.name,
-                    "role": employee.role,
-                    "active": employee.active,
-                    "embeddings": emb_count,
-                    "folder": f"db_karyawan/{folder.name}",
-                    "photo_count": len(photos),
-                    "present_today": det_today > 0,
-                    "detections_today": det_today,
-                    "last_seen_today": last_seen_dt.isoformat() if last_seen_dt else None,
-                }
-            )
-        return {"items": items}
+        return _query_employees(db)
 
 
 @app.get("/api/employees/{employee_id}", dependencies=[Depends(require_auth)])
 def employee_detail(employee_id: int) -> dict:
-    initialize_database()
+    _ensure_db()
     with SessionLocal() as db:
         employee = db.get(Employee, employee_id)
         if employee is None:
@@ -593,6 +719,7 @@ def employee_detail(employee_id: int) -> dict:
             "active": employee.active,
             "embeddings": int(emb_count),
             "folder": f"db_karyawan/{folder.name}",
+            **_employee_satusehat_fields(employee),
             "photos": [
                 {
                     "name": p.name,
@@ -620,13 +747,26 @@ def employee_photo(employee_id: int, filename: str) -> Response:
 
 
 def _save_employee_and_photos(employee_id: int | None, body: EmployeeSaveBody) -> dict:
-    initialize_database()
+    _ensure_db()
     code = body.code.strip()
     name = body.name.strip()
     role = body.role.strip() or "Karyawan"
     if not code or not name:
         raise HTTPException(status_code=400, detail="Kode dan nama pegawai wajib diisi")
 
+    # NIK: validate and encrypt before touching any file or row.
+    nik_update: tuple[str | None, str | None] | None = None  # (encrypted, last4); None = leave unchanged
+    if body.nik is not None:
+        nik = body.nik.strip()
+        if nik == "":
+            nik_update = (None, None)
+        else:
+            if not re.fullmatch(r"\d{16}", nik):
+                raise HTTPException(status_code=400, detail="NIK harus 16 digit angka")
+            try:
+                nik_update = (satusehat.encrypt(nik), nik[-4:])
+            except satusehat.SatuSehatError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.message) from None
     with SessionLocal() as db:
         existing_by_code = db.scalar(select(Employee).where(Employee.employee_code == code))
         if employee_id is None:
@@ -722,6 +862,12 @@ def _save_employee_and_photos(employee_id: int | None, body: EmployeeSaveBody) -
             employee.role = role
             employee.active = body.active
 
+        if nik_update is not None:
+            employee.nik_encrypted, employee.nik_last4 = nik_update
+            # A changed/cleared NIK invalidates the previous SatuSehat mapping.
+            employee.satusehat_practitioner_id = None
+            employee.satusehat_synced_at = None
+
         if photos_changed:
             db.query(FaceEmbedding).filter_by(employee_id=employee.id).delete()
             for vec in vectors:
@@ -739,6 +885,7 @@ def _save_employee_and_photos(employee_id: int | None, body: EmployeeSaveBody) -
             "active": employee.active,
             "embeddings": int(total_emb),
             "folder": f"db_karyawan/{folder.name}",
+            **_employee_satusehat_fields(employee),
             "accepted_photos": accepted,
             "skipped_photos": skipped,
             "photos": [
@@ -762,6 +909,195 @@ def update_employee(employee_id: int, body: EmployeeSaveBody) -> dict:
     return _save_employee_and_photos(employee_id, body)
 
 
+def _audit(db: Session, action: str, detail: str) -> None:
+    db.add(AuditLog(action=action, actor="dashboard", detail=detail[:1000]))
+
+
+def _satusehat_error(exc: satusehat.SatuSehatError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+def _mask_secret(row: SatuSehatSettings | None) -> str | None:
+    if row is None or not row.client_secret_encrypted:
+        return None
+    try:
+        secret = satusehat.decrypt(row.client_secret_encrypted)
+    except satusehat.SatuSehatError:
+        return "•" * 12
+    return f"{'•' * 12}{secret[-4:]}" if len(secret) >= 12 else "•" * 12
+
+
+def _satusehat_view(row: SatuSehatSettings | None) -> dict:
+    env = row.env if row else "dev"
+    return {
+        "env": env,
+        "client_id": row.client_id if row else "",
+        "organization_id": row.organization_id if row else "",
+        "client_secret_masked": _mask_secret(row),
+        "has_client_secret": bool(row and row.client_secret_encrypted),
+        "location_name": row.location_name if row else "",
+        "location_id": row.location_id if row else None,
+        "location_synced_at": row.location_synced_at.isoformat() if row and row.location_synced_at else None,
+        "last_test_at": row.last_test_at.isoformat() if row and row.last_test_at else None,
+        "last_test_ok": row.last_test_ok if row else None,
+        "last_test_message": row.last_test_message if row else None,
+        "base_url": satusehat.base_url(env),
+        "encryption_key_configured": satusehat.encryption_ready(),
+        "environments": {name: satusehat.base_url(name) for name in satusehat.ENVIRONMENTS},
+    }
+
+
+def _satusehat_config(row: SatuSehatSettings | None) -> satusehat.Config:
+    if row is None or not (row.client_id and row.organization_id and row.client_secret_encrypted):
+        raise HTTPException(status_code=400, detail="Lengkapi Client ID, Client Secret, dan Organization ID dulu.")
+    try:
+        secret = satusehat.decrypt(row.client_secret_encrypted)
+    except satusehat.SatuSehatError as exc:
+        raise _satusehat_error(exc) from None
+    return satusehat.Config(
+        env=row.env, client_id=row.client_id, client_secret=secret, organization_id=row.organization_id
+    )
+
+
+@app.get("/api/satusehat/settings", dependencies=[Depends(require_auth)])
+def satusehat_get_settings() -> dict:
+    _ensure_db()
+    with SessionLocal() as db:
+        return _satusehat_view(db.get(SatuSehatSettings, 1))
+
+
+@app.put("/api/satusehat/settings", dependencies=[Depends(require_auth), Depends(require_same_origin)])
+def satusehat_put_settings(body: SatuSehatSettingsBody) -> dict:
+    _ensure_db()
+    client_id = body.client_id.strip()
+    organization_id = body.organization_id.strip()
+    if organization_id and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", organization_id):
+        raise HTTPException(status_code=400, detail="Organization ID hanya boleh huruf, angka, titik, minus, garis bawah")
+    new_secret = (body.client_secret or "").strip()
+    encrypted: str | None = None
+    if new_secret:
+        try:
+            encrypted = satusehat.encrypt(new_secret)
+        except satusehat.SatuSehatError as exc:
+            raise _satusehat_error(exc) from None
+    with SessionLocal() as db:
+        row = db.get(SatuSehatSettings, 1)
+        if row is None:
+            row = SatuSehatSettings(id=1)
+            db.add(row)
+        # Any identity/environment change invalidates the saved location and last test result.
+        identity_changed = (row.env, row.client_id, row.organization_id) != (body.env, client_id, organization_id)
+        row.env = body.env
+        row.client_id = client_id
+        row.organization_id = organization_id
+        if encrypted is not None:
+            row.client_secret_encrypted = encrypted
+        if identity_changed or encrypted is not None:
+            row.last_test_at = None
+            row.last_test_ok = None
+            row.last_test_message = None
+        if identity_changed:
+            row.location_id = None
+            row.location_synced_at = None
+        row.location_name = body.location_name.strip()
+        row.updated_at = datetime.now(timezone.utc)
+        _audit(db, "satusehat_settings_updated", f"env={body.env} secret_changed={encrypted is not None}")
+        db.commit()
+        satusehat.clear_token_cache()
+        return _satusehat_view(row)
+
+
+@app.get("/api/satusehat/status", dependencies=[Depends(require_auth)])
+def satusehat_status() -> dict:
+    _ensure_db()
+    with SessionLocal() as db:
+        view = _satusehat_view(db.get(SatuSehatSettings, 1))
+    return {
+        key: view[key]
+        for key in (
+            "env",
+            "base_url",
+            "has_client_secret",
+            "encryption_key_configured",
+            "last_test_at",
+            "last_test_ok",
+            "last_test_message",
+            "location_id",
+        )
+    }
+
+
+@app.post("/api/satusehat/test", dependencies=[Depends(require_auth), Depends(require_same_origin)])
+def satusehat_test() -> dict:
+    _ensure_db()
+    with SessionLocal() as db:
+        row = db.get(SatuSehatSettings, 1)
+        cfg = _satusehat_config(row)
+        assert row is not None
+        try:
+            org_name = satusehat.test_connection(cfg)
+            ok, message = True, f"Terhubung. Organisasi: {org_name}"
+        except satusehat.SatuSehatError as exc:
+            ok, message = False, exc.message
+        row.last_test_at = datetime.now(timezone.utc)
+        row.last_test_ok = ok
+        row.last_test_message = message[:500]
+        _audit(db, "satusehat_connection_test", f"env={row.env} ok={ok}")
+        db.commit()
+        return {"ok": ok, "message": message, "tested_at": row.last_test_at.isoformat()}
+
+
+@app.post("/api/satusehat/location/sync", dependencies=[Depends(require_auth), Depends(require_same_origin)])
+def satusehat_sync_location() -> dict:
+    _ensure_db()
+    with SessionLocal() as db:
+        row = db.get(SatuSehatSettings, 1)
+        cfg = _satusehat_config(row)
+        assert row is not None
+        name = row.location_name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Isi nama lokasi (ruangan/kamera) dulu.")
+        code = os.getenv("CAMERA_ID", "local-webcam-01")
+        try:
+            location_id = satusehat.ensure_location(cfg, code, name)
+        except satusehat.SatuSehatError as exc:
+            raise _satusehat_error(exc) from None
+        row.location_id = location_id
+        row.location_synced_at = datetime.now(timezone.utc)
+        _audit(db, "satusehat_location_synced", f"env={row.env} code={code}")
+        db.commit()
+        return {"location_id": location_id, "synced_at": row.location_synced_at.isoformat()}
+
+
+@app.post(
+    "/api/employees/{employee_id}/satusehat/sync",
+    dependencies=[Depends(require_auth), Depends(require_same_origin)],
+)
+def satusehat_sync_employee(employee_id: int) -> dict:
+    _ensure_db()
+    with SessionLocal() as db:
+        cfg = _satusehat_config(db.get(SatuSehatSettings, 1))
+        employee = db.get(Employee, employee_id)
+        if employee is None:
+            raise HTTPException(status_code=404, detail="Pegawai tidak ditemukan")
+        if not employee.nik_encrypted:
+            raise HTTPException(status_code=400, detail="Isi NIK pegawai dan simpan dulu sebelum sinkronisasi.")
+        try:
+            nik = satusehat.decrypt(employee.nik_encrypted)
+            practitioner_id = satusehat.find_practitioner_id(cfg, nik)
+        except satusehat.SatuSehatError as exc:
+            raise _satusehat_error(exc) from None
+        if practitioner_id is None:
+            raise HTTPException(
+                status_code=404, detail="NIK ini tidak terdaftar sebagai Practitioner di SatuSehat."
+            )
+        employee.satusehat_practitioner_id = practitioner_id
+        employee.satusehat_synced_at = datetime.now(timezone.utc)
+        _audit(db, "satusehat_practitioner_synced", f"employee_id={employee.id} env={cfg.env}")
+        db.commit()
+        return _employee_satusehat_fields(employee)
+
+
 @app.get("/api/camera/settings", dependencies=[Depends(require_auth)])
 def camera_settings() -> dict:
     return _settings().model_dump()
@@ -769,20 +1105,24 @@ def camera_settings() -> dict:
 
 @app.put("/api/camera/settings", dependencies=[Depends(require_auth), Depends(require_same_origin)])
 def update_camera_settings(body: CameraSettingsBody) -> dict:
+    global _restarting
     if not _apply_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Pengaturan kamera sedang diterapkan")
     try:
         with _state_lock:
             worker = _worker
             was_running = worker is not None and worker.is_alive() and not _stop.is_set()
+            if was_running:
+                _restarting = True
             if worker is not None and worker.is_alive():
                 _stop.set()
                 _frame_ready.notify_all()
+                _notify_ws_waiters()
         if worker is not None and worker.is_alive():
             worker.join(timeout=15)
             if worker.is_alive():
                 raise HTTPException(status_code=409, detail="Kamera belum berhenti; pengaturan tidak disimpan")
-        initialize_database()
+        _ensure_db()
         with SessionLocal.begin() as db:
             row = db.get(CameraSettings, 1)
             if row is None:
@@ -794,6 +1134,10 @@ def update_camera_settings(body: CameraSettingsBody) -> dict:
             _start_worker(body)
         return {"settings": body.model_dump(), "running": was_running}
     finally:
+        with _state_lock:
+            if _restarting:
+                _restarting = False
+                _notify_ws_waiters()
         _apply_lock.release()
 
 
@@ -838,24 +1182,62 @@ def system_resources() -> dict:
         return result
 
 
+def _camera_status_dict() -> dict:
+    """Build camera status snapshot. Caller must hold _state_lock / _frame_ready."""
+    running = _worker is not None and _worker.is_alive()
+    active = running and not _stop.is_set()
+    effective_running = active or _restarting
+    return {
+        "running": effective_running,
+        "stopping": running and _stop.is_set() and not _restarting,
+        "fps": _fps if active else 0.0,
+        "has_frame": _frame is not None and active,
+        "generation": _generation if effective_running else 0,
+        "frame_version": _frame_version if active else 0,
+        "error": _error,
+        "active_config": _active_config if effective_running else None,
+        "live_staff": _live_counts["staff"] if active else 0,
+        "live_customers": _live_counts["customers"] if active else 0,
+        "live_observing": _live_counts["observing"] if active else 0,
+    }
+
+
+def _core_status_signature(status: dict) -> tuple:
+    return (
+        status["running"],
+        status["stopping"],
+        status["has_frame"],
+        status["generation"],
+        status["error"],
+        status["live_staff"],
+        status["live_customers"],
+        status["live_observing"],
+    )
+
+
+@app.get("/api/dashboard", dependencies=[Depends(require_auth)])
+def dashboard_bundle(visitor_limit: int = 100, event_limit: int = 60) -> dict:
+    _ensure_db()
+    with SessionLocal() as db:
+        overview_data = _query_overview(db)
+        visitors_data = _query_visitors(db, limit=visitor_limit)["items"]
+        events_data = _query_events(db, limit=event_limit)["items"]
+        employees_data = _query_employees(db)["items"]
+    with _state_lock:
+        cam_status = _camera_status_dict()
+    return {
+        "overview": overview_data,
+        "visitors": visitors_data,
+        "events": events_data,
+        "employees": employees_data,
+        "camera": cam_status,
+    }
+
+
 @app.get("/api/camera/status", dependencies=[Depends(require_auth)])
 def camera_status() -> dict:
     with _state_lock:
-        running = _worker is not None and _worker.is_alive()
-        active = running and not _stop.is_set()
-        return {
-            "running": active,
-            "stopping": running and _stop.is_set(),
-            "fps": _fps if running else 0,
-            "has_frame": _frame is not None and active,
-            "generation": _generation if active else 0,
-            "frame_version": _frame_version if active else 0,
-            "error": _error,
-            "active_config": _active_config if active else None,
-            "live_staff": _live_counts["staff"] if active else 0,
-            "live_customers": _live_counts["customers"] if active else 0,
-            "live_observing": _live_counts["observing"] if active else 0,
-        }
+        return _camera_status_dict()
 
 
 @app.post("/api/camera/start", dependencies=[Depends(require_auth), Depends(require_same_origin)])
@@ -877,13 +1259,27 @@ def camera_start() -> dict:
 
 @app.post("/api/camera/stop", dependencies=[Depends(require_auth), Depends(require_same_origin)])
 def camera_stop() -> dict:
+    global _worker, _frame, _fps
     if not _apply_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Pengaturan kamera sedang diterapkan")
     try:
         with _frame_ready:
+            worker = _worker
             _stop.set()
             _frame_ready.notify_all()
-        return {"stopping": True}
+            _notify_ws_waiters()
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=15)
+            if worker.is_alive():
+                raise HTTPException(status_code=409, detail="Kamera belum berhenti; coba sesaat lagi")
+        with _frame_ready:
+            if _worker is worker:
+                _worker = None
+            _frame = None
+            _fps = 0.0
+            _frame_ready.notify_all()
+            _notify_ws_waiters()
+        return {"stopping": False, "running": False}
     finally:
         _apply_lock.release()
 
@@ -897,6 +1293,145 @@ def camera_frame() -> Response:
     return Response(content=frame, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
+@app.websocket("/api/camera/ws")
+async def camera_ws(websocket: WebSocket) -> None:
+    await websocket.accept()
+    if not _ws_same_origin(websocket):
+        await websocket.close(code=1008, reason="Invalid origin")
+        return
+    if not _authenticated(websocket):
+        await websocket.close(code=4401, reason="Login required")
+        return
+
+    initial_sub = websocket.query_params.get("subscribe", "1") != "0"
+    token = websocket.cookies.get(COOKIE_NAME, "")
+    loop = asyncio.get_running_loop()
+    frame_event = asyncio.Event()
+    client_state: dict[str, object] = {
+        "subscribe_frames": initial_sub,
+        "force_frame": initial_sub,
+        "force_status": True,
+        "disconnected": False,
+    }
+
+    async def _receive_control() -> None:
+        try:
+            while not client_state["disconnected"]:
+                raw = await websocket.receive_text()
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(data, dict):
+                    with _state_lock:
+                        changed = False
+                        if "subscribe_frames" in data:
+                            want = bool(data["subscribe_frames"])
+                            prev_want = bool(client_state["subscribe_frames"])
+                            client_state["subscribe_frames"] = want
+                            if want and not prev_want:
+                                client_state["force_frame"] = True
+                                changed = True
+                            elif want != prev_want:
+                                changed = True
+                        if data.get("force_frame") and client_state["subscribe_frames"]:
+                            client_state["force_frame"] = True
+                            changed = True
+                        if data.get("force_status"):
+                            client_state["force_status"] = True
+                            changed = True
+                        if changed:
+                            frame_event.set()
+        except Exception:
+            pass
+        finally:
+            with _state_lock:
+                client_state["disconnected"] = True
+                frame_event.set()
+
+    with _state_lock:
+        _ws_waiters[frame_event] = (loop, client_state)
+        frame_event.set()
+
+    recv_task = asyncio.create_task(_receive_control())
+    last_version = -1
+    last_core_sig: tuple | None = None
+    last_sent_fps = -1.0
+    last_fps_sent_at = 0.0
+    try:
+        while not client_state["disconnected"]:
+            now_mono = time.monotonic()
+            now_wall = time.time()
+            with _state_lock:
+                frame_event.clear()
+                expiry = _session_tokens.get(token, 0.0) if token else 0.0
+                session_valid = expiry > now_wall
+                if not session_valid and token:
+                    _session_tokens.pop(token, None)
+                status = _camera_status_dict()
+                core_sig = _core_status_signature(status)
+                want_frames = bool(client_state["subscribe_frames"])
+                force_frame = bool(client_state["force_frame"])
+                force_status = bool(client_state["force_status"])
+
+                has_new_frame = (
+                    want_frames
+                    and status["has_frame"]
+                    and _frame is not None
+                    and (_frame_version != last_version or force_frame)
+                )
+                frame_bytes = _frame if has_new_frame else None
+                if frame_bytes is not None:
+                    last_version = _frame_version
+                    client_state["force_frame"] = False
+
+                fps_interval = 1.0 if want_frames else 2.0
+                core_changed = (core_sig != last_core_sig) or force_status
+                fps_changed = (
+                    status["running"]
+                    and abs(status["fps"] - last_sent_fps) >= 0.2
+                    and (now_mono - last_fps_sent_at) >= fps_interval
+                )
+                if core_changed or fps_changed:
+                    status_payload = status
+                    last_core_sig = core_sig
+                    last_sent_fps = status["fps"]
+                    last_fps_sent_at = now_mono
+                    client_state["force_status"] = False
+                else:
+                    status_payload = None
+
+            if not session_valid:
+                await websocket.close(code=4401, reason="Session expired")
+                break
+
+            if status_payload is not None and not client_state["disconnected"]:
+                await websocket.send_json({"type": "status", **status_payload})
+
+            if frame_bytes is not None and client_state["subscribe_frames"] and not client_state["disconnected"]:
+                await websocket.send_bytes(frame_bytes)
+
+            if client_state["disconnected"]:
+                break
+
+            wait_timeout = max(0.5, expiry - time.time())
+            try:
+                await asyncio.wait_for(frame_event.wait(), timeout=wait_timeout)
+            except asyncio.TimeoutError:
+                pass
+    except (WebSocketDisconnect, RuntimeError, OSError):
+        pass
+    finally:
+        with _state_lock:
+            client_state["disconnected"] = True
+            _ws_waiters.pop(frame_event, None)
+        recv_task.cancel()
+        try:
+            await recv_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 @app.get("/api/camera/stream", dependencies=[Depends(require_auth)])
 async def camera_stream(request: Request) -> Response:
     token = request.cookies.get(COOKIE_NAME, "")
@@ -906,31 +1441,46 @@ async def camera_stream(request: Request) -> Response:
         if worker is None or not worker.is_alive() or _stop.is_set():
             raise HTTPException(status_code=404, detail="Kamera belum berjalan")
 
+    loop = asyncio.get_running_loop()
+    frame_event = asyncio.Event()
+    stream_state: dict[str, object] = {"subscribe_frames": True}
+
     async def frames():
         last_version = -1
-        while True:
-            if await request.is_disconnected():
-                return
+        with _state_lock:
+            _ws_waiters[frame_event] = (loop, stream_state)
+            frame_event.set()
+        try:
+            while True:
+                if await request.is_disconnected():
+                    return
+                with _state_lock:
+                    frame_event.clear()
+                    if _stop.is_set() or _generation != generation or not worker.is_alive():
+                        return
+                    if _session_tokens.get(token, 0) <= time.time():
+                        _session_tokens.pop(token, None)
+                        return
+                    if _frame is not None and _frame_version != last_version:
+                        frame = _frame
+                        last_version = _frame_version
+                    else:
+                        frame = None
+                if frame is not None:
+                    yield (
+                        b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                        + str(len(frame)).encode()
+                        + b"\r\n\r\n"
+                        + frame
+                        + b"\r\n"
+                    )
+                try:
+                    await asyncio.wait_for(frame_event.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
             with _state_lock:
-                if _stop.is_set() or _generation != generation or not worker.is_alive():
-                    return
-                if _session_tokens.get(token, 0) <= time.time():
-                    _session_tokens.pop(token, None)
-                    return
-                if _frame is not None and _frame_version != last_version:
-                    frame = _frame
-                    last_version = _frame_version
-                else:
-                    frame = None
-            if frame is not None:
-                yield (
-                    b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                    + str(len(frame)).encode()
-                    + b"\r\n\r\n"
-                    + frame
-                    + b"\r\n"
-                )
-            await asyncio.sleep(0.08)
+                _ws_waiters.pop(frame_event, None)
 
     return StreamingResponse(
         frames(),
@@ -953,4 +1503,4 @@ if __name__ == "__main__":
     port = int(os.getenv("DASHBOARD_PORT", "8000"))
     if not 1 <= port <= 65535:
         raise ValueError("DASHBOARD_PORT must be between 1 and 65535")
-    uvicorn.run(app, host="127.0.0.1", port=port, workers=1)
+    uvicorn.run(app, host="127.0.0.1", port=port, workers=1, timeout_keep_alive=65)

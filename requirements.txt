@@ -20,3 +20,4 @@ psutil
 # Optional S3-compatible object storage and webhooks
 boto3
 requests
+cryptography

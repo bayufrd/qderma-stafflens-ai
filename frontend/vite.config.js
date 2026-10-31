@@ -1,5 +1,14 @@
+import http from 'node:http'
 import vue from '@vitejs/plugin-vue'
 import { defineConfig, loadEnv } from 'vite'
+
+const keepAliveAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 16,
+  maxFreeSockets: 8,
+  timeout: 60000,
+  keepAliveMsecs: 30000,
+})
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, '..', 'DASHBOARD_')
@@ -11,7 +20,14 @@ export default defineConfig(({ mode }) => {
     plugins: [vue()],
     server: {
       host: '127.0.0.1',
-      proxy: { '/api': { target: `http://127.0.0.1:${port}`, changeOrigin: false } },
+      proxy: {
+        '/api': {
+          target: `http://127.0.0.1:${port}`,
+          changeOrigin: false,
+          ws: true,
+          agent: keepAliveAgent,
+        },
+      },
     },
   }
 })

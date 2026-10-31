@@ -160,4 +160,5 @@ Buka `http://127.0.0.1:8000`, masuk dengan `DASHBOARD_PASSWORD`, lalu klik **Mul
 - [Panduan Portal Dashboard Lokal](docs/DASHBOARD.md)
 - [Panduan Webcam, Pendaftaran Pegawai, dan Database](docs/WEBCAM_DAN_DATABASE.md)
 - [Setup Konfigurasi Infrastruktur](docs/SETUP_KONFIGURASI.md)
+- [Integrasi SatuSehat](docs/INTEGRASI_SATUSEHAT.md)
 - [Panduan Penggunaan Pipeline Dasar](docs/PANDUAN_PENGGUNAAN.md)

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import './style.css'
 
 const authenticated = ref(false)
@@ -19,6 +19,11 @@ const settings = ref({
 })
 const resources = ref(null)
 const settingsNotice = ref('')
+const satusehat = ref(null)
+const satusehatForm = ref({ env: 'dev', client_id: '', organization_id: '', client_secret: '', location_name: '' })
+const satusehatNotice = ref('')
+const satusehatError = ref('')
+const satusehatBusy = ref('')
 const overview = ref({
   customers_today: 0,
   returning_customers_today: 0,
@@ -45,139 +50,236 @@ const camera = ref({
 })
 const dataError = ref('')
 const lastUpdated = ref(null)
-const frameUrl = ref('')
-const cameraImgRef = ref(null)
-let frameLoopToken = 0
-let streamRunning = false
-let currentBlobUrl = ''
-let frameAbortController = null
-let streamGeneration = 0
+const hasRenderedFrame = ref(false)
+const cameraCanvasRef = ref(null)
+let cameraWs = null
+let wsReconnectTimer = null
+let wsSessionToken = 0
+let wsConnected = false
+let renderEpoch = 0
+let frameRenderBusy = false
+let pendingFrameBlob = null
 const search = ref('')
 let timer
 let resourcesTimer
 
-function findHeaderEnd(buf) {
-  for (let i = 0; i <= buf.length - 4; i++) {
-    if (buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10) {
-      return i
-    }
+function clearCanvas() {
+  renderEpoch++
+  hasRenderedFrame.value = false
+  pendingFrameBlob = null
+  const canvas = cameraCanvasRef.value
+  if (canvas) {
+    const ctx = canvas.getContext('2d', { alpha: false })
+    if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
+    canvas.width = 0
+    canvas.height = 0
   }
-  return -1
 }
 
-function concatUint8(a, b) {
-  if (!a || a.length === 0) return b
-  const out = new Uint8Array(a.length + b.length)
-  out.set(a, 0)
-  out.set(b, a.length)
-  return out
+function applyCameraStatus(nextStatus) {
+  if (!nextStatus) return
+  const prevGen = camera.value.generation || 0
+  const nextGen = nextStatus.generation || 0
+  const genChanged = Boolean(prevGen && nextGen && prevGen !== nextGen)
+  camera.value = {
+    running: Boolean(nextStatus.running),
+    stopping: Boolean(nextStatus.stopping),
+    fps: nextStatus.fps ?? 0,
+    has_frame: Boolean(nextStatus.has_frame),
+    generation: nextGen,
+    frame_version: nextStatus.frame_version ?? 0,
+    error: nextStatus.error ?? null,
+    active_config: nextStatus.active_config ?? null,
+    live_staff: nextStatus.live_staff ?? 0,
+    live_customers: nextStatus.live_customers ?? 0,
+    live_observing: nextStatus.live_observing ?? 0,
+  }
+  if (!camera.value.running || !camera.value.has_frame || genChanged) {
+    clearCanvas()
+  }
 }
 
-function disconnectStream() {
-  frameLoopToken++
-  streamRunning = false
-  if (frameAbortController) {
-    try {
-      frameAbortController.abort()
-    } catch (_) {
-      /* ignore abort error */
-    }
-    frameAbortController = null
-  }
-  if (currentBlobUrl) {
-    URL.revokeObjectURL(currentBlobUrl)
-    currentBlobUrl = ''
-  }
-  frameUrl.value = ''
-  streamGeneration = 0
-}
-
-function connectStream(gen = 0) {
-  streamGeneration = gen || streamGeneration || 1
-  if (streamRunning) return
-  streamRunning = true
-  const myToken = ++frameLoopToken
-
-  ;(async () => {
-    const decoder = new TextDecoder()
-    while (
-      myToken === frameLoopToken &&
-      authenticated.value &&
-      page.value === 'Ringkasan' &&
-      camera.value.running
-    ) {
-      const controller = new AbortController()
-      frameAbortController = controller
+async function renderFrameToCanvas(blob) {
+  if (!blob || page.value !== 'Ringkasan' || !camera.value.running || !camera.value.has_frame) return
+  pendingFrameBlob = { blob, epoch: renderEpoch }
+  if (frameRenderBusy) return
+  frameRenderBusy = true
+  try {
+    while (pendingFrameBlob && page.value === 'Ringkasan' && camera.value.running && camera.value.has_frame) {
+      const { blob: currentBlob, epoch: myEpoch } = pendingFrameBlob
+      pendingFrameBlob = null
+      if (myEpoch !== renderEpoch) continue
+      if (!cameraCanvasRef.value && page.value === 'Ringkasan') {
+        await nextTick()
+      }
+      const canvas = cameraCanvasRef.value
+      if (myEpoch !== renderEpoch) continue
+      if (!canvas || page.value !== 'Ringkasan' || !camera.value.running || !camera.value.has_frame) break
+      let bitmap = null
       try {
-        const res = await fetch(`/api/camera/stream?session=${Date.now()}-${myToken}`, {
-          credentials: 'same-origin',
-          cache: 'no-store',
-          signal: controller.signal,
-        })
-        if (myToken !== frameLoopToken || !res.ok || !res.body) {
-          await new Promise(resolve => setTimeout(resolve, 600))
-          continue
-        }
-        const reader = res.body.getReader()
-        let buffer = new Uint8Array(0)
-        while (myToken === frameLoopToken) {
-          const { value, done } = await reader.read()
-          if (done || myToken !== frameLoopToken) break
-          if (value && value.length) {
-            buffer = concatUint8(buffer, value)
-            let latestJpeg = null
-            while (true) {
-              const headerEnd = findHeaderEnd(buffer)
-              if (headerEnd === -1) break
-              const headerText = decoder.decode(buffer.subarray(0, headerEnd))
-              const match = headerText.match(/Content-Length:\s*(\d+)/i)
-              if (!match) {
-                buffer = buffer.slice(headerEnd + 4)
-                continue
-              }
-              const contentLength = Number(match[1])
-              const bodyStart = headerEnd + 4
-              const bodyEnd = bodyStart + contentLength
-              if (buffer.length < bodyEnd) break
-              latestJpeg = buffer.slice(bodyStart, bodyEnd)
-              let nextOffset = bodyEnd
-              if (buffer[nextOffset] === 13 && buffer[nextOffset + 1] === 10) {
-                nextOffset += 2
-              }
-              buffer = buffer.slice(nextOffset)
-            }
-            if (latestJpeg) {
-              const nextUrl = URL.createObjectURL(new Blob([latestJpeg], { type: 'image/jpeg' }))
-              const prevUrl = currentBlobUrl
-              currentBlobUrl = nextUrl
-              frameUrl.value = nextUrl
-              if (prevUrl) URL.revokeObjectURL(prevUrl)
-            }
+        bitmap = await createImageBitmap(currentBlob)
+        if (
+          myEpoch === renderEpoch &&
+          cameraCanvasRef.value === canvas &&
+          camera.value.running &&
+          camera.value.has_frame &&
+          page.value === 'Ringkasan'
+        ) {
+          if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+            canvas.width = bitmap.width
+            canvas.height = bitmap.height
+          }
+          const ctx = canvas.getContext('2d', { alpha: false })
+          if (ctx) {
+            ctx.drawImage(bitmap, 0, 0)
+            hasRenderedFrame.value = true
           }
         }
       } catch (_) {
-        /* reconnect if stream was interrupted */
-      }
-      if (myToken === frameLoopToken) {
-        await new Promise(resolve => setTimeout(resolve, 500))
+        /* skip corrupted frame */
+      } finally {
+        if (bitmap) bitmap.close()
       }
     }
-    if (myToken === frameLoopToken) {
-      streamRunning = false
+  } finally {
+    if (
+      !pendingFrameBlob ||
+      pendingFrameBlob.epoch !== renderEpoch ||
+      page.value !== 'Ringkasan' ||
+      !camera.value.running ||
+      !camera.value.has_frame
+    ) {
+      pendingFrameBlob = null
     }
-  })()
+    frameRenderBusy = false
+  }
+}
+
+function syncCameraSubscription(forceStatus = false, forceFrame = false) {
+  if (cameraWs && cameraWs.readyState === WebSocket.OPEN) {
+    try {
+      cameraWs.send(
+        JSON.stringify({
+          subscribe_frames: page.value === 'Ringkasan',
+          force_frame: Boolean(forceFrame),
+          force_status: Boolean(forceStatus),
+        }),
+      )
+    } catch (_) {
+      /* ignore send error */
+    }
+  }
+}
+
+function disconnectCameraSocket() {
+  wsSessionToken++
+  wsConnected = false
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer)
+    wsReconnectTimer = null
+  }
+  if (cameraWs) {
+    const ws = cameraWs
+    cameraWs = null
+    ws.onopen = null
+    ws.onmessage = null
+    ws.onerror = null
+    ws.onclose = null
+    try {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close(1000, 'client disconnect')
+      }
+    } catch (_) {
+      /* ignore close error */
+    }
+  }
+  clearCanvas()
+}
+
+function connectCameraSocket(forceStatus = false) {
+  if (!authenticated.value) return
+  if (cameraWs && (cameraWs.readyState === WebSocket.OPEN || cameraWs.readyState === WebSocket.CONNECTING)) {
+    if (forceStatus) syncCameraSubscription(true, page.value === 'Ringkasan')
+    return
+  }
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer)
+    wsReconnectTimer = null
+  }
+  const myToken = ++wsSessionToken
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const subFlag = page.value === 'Ringkasan' ? 1 : 0
+  const ws = new WebSocket(`${proto}//${window.location.host}/api/camera/ws?subscribe=${subFlag}`)
+  ws.binaryType = 'blob'
+  cameraWs = ws
+
+  ws.onopen = () => {
+    if (myToken !== wsSessionToken) return
+    wsConnected = true
+    syncCameraSubscription(true, page.value === 'Ringkasan')
+  }
+
+  ws.onmessage = event => {
+    if (myToken !== wsSessionToken) return
+    if (typeof event.data === 'string') {
+      try {
+        const payload = JSON.parse(event.data)
+        if (payload.type === 'status') {
+          applyCameraStatus(payload)
+        }
+      } catch (_) {
+        /* ignore malformed json */
+      }
+    } else if (event.data instanceof Blob) {
+      if (page.value === 'Ringkasan') {
+        renderFrameToCanvas(event.data)
+      }
+    }
+  }
+
+  ws.onerror = () => {
+    /* handled by onclose */
+  }
+
+  ws.onclose = async event => {
+    if (myToken !== wsSessionToken) return
+    wsConnected = false
+    cameraWs = null
+    clearCanvas()
+    if (event.code === 4401 || event.code === 1008) {
+      authenticated.value = false
+      stopPolling()
+      return
+    }
+    if (event.code === 1006 && authenticated.value) {
+      try {
+        const sess = await api('/auth/session')
+        if (!sess.authenticated) {
+          authenticated.value = false
+          stopPolling()
+          return
+        }
+      } catch (_) {
+        /* server unreachable; retry on timer */
+      }
+    }
+    if (authenticated.value) {
+      wsReconnectTimer = setTimeout(() => {
+        if (myToken === wsSessionToken && authenticated.value) connectCameraSocket(true)
+      }, 1000)
+    }
+  }
 }
 
 function selectPage(targetPage) {
   if (page.value === targetPage) return
   if (page.value === 'Ringkasan' && targetPage !== 'Ringkasan') {
-    disconnectStream()
+    clearCanvas()
   }
   page.value = targetPage
   search.value = ''
-  if (targetPage === 'Ringkasan' && camera.value.running && camera.value.has_frame) {
-    connectStream(camera.value.generation)
-  }
+  const enteringSummary = targetPage === 'Ringkasan'
+  syncCameraSubscription(enteringSummary, enteringSummary)
 }
 
 // Employee Modal & Photo Upload State
@@ -205,7 +307,7 @@ async function api(path, options = {}) {
   const response = await fetch(`/api${path}`, { credentials: 'same-origin', cache: 'no-store', ...options })
   if (response.status === 401 && path !== '/auth/login') {
     authenticated.value = false
-    frameUrl.value = ''
+    disconnectCameraSocket()
     stopPolling()
     throw new Error('Sesi berakhir. Masuk kembali.')
   }
@@ -219,33 +321,21 @@ async function api(path, options = {}) {
 async function refresh(forceStream = false) {
   if (!authenticated.value) return
   try {
-    const [summary, visitorData, eventData, employeeData, cameraData] = await Promise.all([
-      api('/overview'),
-      api('/visitors?limit=100'),
-      api('/events?limit=60'),
-      api('/employees'),
-      api('/camera/status'),
-    ])
-    overview.value = summary
-    visitors.value = visitorData.items || []
-    events.value = eventData.items || []
-    employees.value = employeeData.items || []
-    camera.value = cameraData
-    if (!cameraData.running || !cameraData.has_frame || page.value !== 'Ringkasan') {
-      if (frameUrl.value || streamRunning) disconnectStream()
-    } else if (
-      forceStream === true ||
-      !streamRunning ||
-      !frameUrl.value ||
-      (cameraData.generation && cameraData.generation !== streamGeneration)
-    ) {
-      if (forceStream === true) disconnectStream()
-      connectStream(cameraData.generation)
+    const bundle = await api('/dashboard')
+    overview.value = bundle.overview
+    visitors.value = bundle.visitors || []
+    events.value = bundle.events || []
+    employees.value = bundle.employees || []
+    if (!wsConnected && bundle.camera) {
+      applyCameraStatus(bundle.camera)
+    } else if (bundle.camera && camera.value.running && bundle.camera.running) {
+      camera.value.fps = bundle.camera.fps ?? camera.value.fps
     }
+    connectCameraSocket(forceStream === true)
     lastUpdated.value = new Date()
     dataError.value = ''
   } catch (error) {
-    disconnectStream()
+    if (!wsConnected || !authenticated.value) clearCanvas()
     dataError.value = error.message
   }
 }
@@ -301,6 +391,92 @@ async function saveSettings() {
   }
 }
 
+function applySatuSehat(view) {
+  satusehat.value = view
+  satusehatForm.value = {
+    env: view.env,
+    client_id: view.client_id,
+    organization_id: view.organization_id,
+    client_secret: '',
+    location_name: view.location_name,
+  }
+}
+
+async function loadSatuSehat() {
+  if (!authenticated.value) return
+  try {
+    applySatuSehat(await api('/satusehat/settings'))
+  } catch (error) {
+    satusehatError.value = error.message
+  }
+}
+
+async function runSatuSehat(kind, action) {
+  satusehatBusy.value = kind
+  satusehatError.value = ''
+  satusehatNotice.value = ''
+  try {
+    await action()
+  } catch (error) {
+    satusehatError.value = error.message
+  } finally {
+    satusehatBusy.value = ''
+  }
+}
+
+function saveSatuSehat() {
+  return runSatuSehat('save', async () => {
+    applySatuSehat(
+      await api('/satusehat/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(satusehatForm.value),
+      }),
+    )
+    satusehatNotice.value = 'Tersimpan. Client Secret terenkripsi di database.'
+  })
+}
+
+function testSatuSehat() {
+  return runSatuSehat('test', async () => {
+    const result = await api('/satusehat/test', { method: 'POST' })
+    satusehatNotice.value = result.message
+    await loadSatuSehat()
+  })
+}
+
+function syncSatuSehatLocation() {
+  return runSatuSehat('location', async () => {
+    // Persist any edited location name first so the sync uses what is on screen.
+    applySatuSehat(
+      await api('/satusehat/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(satusehatForm.value),
+      }),
+    )
+    const result = await api('/satusehat/location/sync', { method: 'POST' })
+    satusehatNotice.value = `Location tersinkron (ID ${result.location_id}).`
+    await loadSatuSehat()
+  })
+}
+
+async function syncEmployeeSatuSehat() {
+  modalSaving.value = true
+  modalError.value = ''
+  modalNotice.value = ''
+  try {
+    const result = await api(`/employees/${modalEmployee.value.id}/satusehat/sync`, { method: 'POST' })
+    modalEmployee.value = { ...modalEmployee.value, ...result }
+    modalNotice.value = `Practitioner SatuSehat ditemukan (ID ${result.satusehat_practitioner_id}).`
+    await refresh()
+  } catch (error) {
+    modalError.value = error.message
+  } finally {
+    modalSaving.value = false
+  }
+}
+
 function suggestNextEmployeeCode() {
   const nums = employees.value
     .map(e => {
@@ -335,6 +511,8 @@ async function openEmployeeModal(emp = null) {
       folder: '',
       embeddings: 0,
       photos: [],
+      nik: '',
+      nik_clear: false,
     }
     return
   }
@@ -349,10 +527,15 @@ async function openEmployeeModal(emp = null) {
     folder: emp.folder || '',
     embeddings: emp.embeddings || 0,
     photos: [],
+    nik: '',
+    nik_clear: false,
+    has_nik: emp.has_nik,
+    nik_masked: emp.nik_masked,
+    satusehat_practitioner_id: emp.satusehat_practitioner_id,
   }
   try {
     const detail = await api(`/employees/${emp.id}`)
-    modalEmployee.value = detail
+    modalEmployee.value = { ...detail, nik: '', nik_clear: false }
   } catch (error) {
     modalError.value = error.message
   } finally {
@@ -418,6 +601,7 @@ async function saveEmployeeModal(reprocessOnly = false) {
         name: modalEmployee.value.name,
         role: modalEmployee.value.role,
         active: Boolean(modalEmployee.value.active),
+        nik: modalEmployee.value.nik_clear ? '' : modalEmployee.value.nik?.trim() || undefined,
         new_photos: pendingUploads.value.map(item => ({
           filename: item.filename,
           data_url: item.data_url,
@@ -426,7 +610,7 @@ async function saveEmployeeModal(reprocessOnly = false) {
         reprocess_embeddings: Boolean(reprocessOnly),
       }),
     })
-    modalEmployee.value = result
+    modalEmployee.value = { ...result, nik: '', nik_clear: false }
     pendingUploads.value = []
     photosToDelete.value = []
     const skippedCount = (result.skipped_photos || []).length
@@ -451,9 +635,11 @@ function stopPolling() {
 
 function startPolling() {
   stopPolling()
+  connectCameraSocket(true)
   refresh()
   refreshResources()
   loadSettings()
+  loadSatuSehat()
   timer = setInterval(refresh, 3000)
   resourcesTimer = setInterval(refreshResources, 5000)
 }
@@ -478,7 +664,7 @@ async function login() {
 }
 
 async function logout() {
-  disconnectStream()
+  disconnectCameraSocket()
   authenticated.value = false
   stopPolling()
   try {
@@ -489,17 +675,13 @@ async function logout() {
 }
 
 async function toggleCamera() {
+  if (busy.value || camera.value.stopping) return
   busy.value = true
   try {
     const wasRunning = camera.value.running
-    disconnectStream()
+    if (wasRunning) clearCanvas()
     await api(wasRunning ? '/camera/stop' : '/camera/start', { method: 'POST' })
     await refresh(true)
-    if (!wasRunning) {
-      setTimeout(() => refresh(), 700)
-      setTimeout(() => refresh(), 1500)
-      setTimeout(() => refresh(), 2400)
-    }
   } catch (error) {
     dataError.value = error.message
   } finally {
@@ -576,8 +758,15 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopPolling()
-  disconnectStream()
+  disconnectCameraSocket()
 })
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    stopPolling()
+    disconnectCameraSocket()
+  })
+}
 </script>
 
 <template>
@@ -746,21 +935,27 @@ onUnmounted(() => {
             </div>
             <div class="camera-layout">
               <div class="camera-stage">
-                <img
-                  v-if="frameUrl"
-                  ref="cameraImgRef"
-                  :src="frameUrl"
-                  alt="Pratinjau kamera teranotasi"
-                  @error="disconnectStream()"
-                />
-                <div v-else class="camera-empty">
+                <canvas
+                  v-show="camera.running && hasRenderedFrame"
+                  ref="cameraCanvasRef"
+                  aria-label="Pratinjau kamera teranotasi"
+                ></canvas>
+                <div v-if="!camera.running || !hasRenderedFrame" class="camera-empty">
                   <div class="viewfinder" aria-hidden="true"><span></span></div>
-                  <strong>{{ camera.running ? 'Menghubungkan kamera…' : 'Kamera belum dinyalakan' }}</strong>
+                  <strong>{{
+                    camera.stopping
+                      ? 'Menghentikan kamera…'
+                      : camera.running
+                        ? 'Menghubungkan kamera…'
+                        : 'Kamera belum dinyalakan'
+                  }}</strong>
                   <span>
                     {{
-                      camera.running
-                        ? 'Menunggu frame pertama dari proses AI.'
-                        : 'Mulai pemrosesan untuk menghitung customer dan staf.'
+                      camera.stopping
+                        ? 'Menunggu proses kamera selesai berhenti.'
+                        : camera.running
+                          ? 'Menunggu frame pertama dari proses AI.'
+                          : 'Mulai pemrosesan untuk menghitung customer dan staf.'
                     }}
                   </span>
                 </div>
@@ -798,9 +993,9 @@ onUnmounted(() => {
                   </strong>
                 </div>
                 <p v-if="camera.error" class="form-error">{{ camera.error }}</p>
-                <button class="button primary camera-action" :disabled="busy" @click="toggleCamera">
-                  {{ camera.running ? 'Hentikan kamera' : 'Mulai kamera & AI' }}
-                  <span aria-hidden="true">{{ camera.running ? '■' : '→' }}</span>
+                <button class="button primary camera-action" :disabled="busy || camera.stopping" @click="toggleCamera">
+                  {{ camera.stopping ? 'Menghentikan kamera…' : camera.running ? 'Hentikan kamera' : 'Mulai kamera & AI' }}
+                  <span aria-hidden="true">{{ camera.running || camera.stopping ? '■' : '→' }}</span>
                 </button>
               </div>
             </div>
@@ -1082,6 +1277,82 @@ onUnmounted(() => {
             </section>
 
             <section class="settings-panel">
+              <h2>Integrasi SatuSehat</h2>
+              <p>
+                Kredensial disimpan di database; Client Secret dienkripsi dan tidak pernah dikirim kembali ke browser.
+              </p>
+              <p v-if="satusehat && !satusehat.encryption_key_configured" class="form-error">
+                SATUSEHAT_ENCRYPTION_KEY belum diisi di .env, jadi Client Secret belum bisa disimpan.
+              </p>
+              <form class="settings-form" autocomplete="off" @submit.prevent="saveSatuSehat">
+                <label for="ss-env">Lingkungan</label>
+                <select id="ss-env" v-model="satusehatForm.env">
+                  <option value="dev">Dev (sandbox)</option>
+                  <option value="staging">Staging</option>
+                  <option value="production">Production</option>
+                </select>
+                <span v-if="satusehat" class="scope-meta mono">{{ satusehat.environments[satusehatForm.env] }}</span>
+                <label for="ss-client-id">Client ID</label>
+                <input id="ss-client-id" v-model="satusehatForm.client_id" type="text" autocomplete="off" />
+                <label for="ss-client-secret">Client Secret</label>
+                <input
+                  id="ss-client-secret"
+                  v-model="satusehatForm.client_secret"
+                  type="password"
+                  autocomplete="new-password"
+                  :placeholder="satusehat?.client_secret_masked || 'Belum diisi'"
+                />
+                <span class="scope-meta">Kosongkan untuk mempertahankan secret yang tersimpan.</span>
+                <label for="ss-org">Organization ID</label>
+                <input id="ss-org" v-model="satusehatForm.organization_id" type="text" autocomplete="off" />
+                <label for="ss-location">Nama lokasi kamera (ruangan)</label>
+                <input
+                  id="ss-location"
+                  v-model="satusehatForm.location_name"
+                  type="text"
+                  placeholder="Mis. Lobi QDerma"
+                />
+                <button class="button primary" type="submit" :disabled="Boolean(satusehatBusy)">
+                  {{ satusehatBusy === 'save' ? 'Menyimpan…' : 'Simpan kredensial' }}
+                  <span aria-hidden="true">→</span>
+                </button>
+                <button
+                  class="button secondary"
+                  type="button"
+                  :disabled="Boolean(satusehatBusy) || !satusehat?.has_client_secret"
+                  @click="testSatuSehat"
+                >
+                  {{ satusehatBusy === 'test' ? 'Menguji…' : 'Tes koneksi' }}
+                </button>
+                <button
+                  class="button secondary"
+                  type="button"
+                  :disabled="Boolean(satusehatBusy) || !satusehat?.has_client_secret"
+                  @click="syncSatuSehatLocation"
+                >
+                  {{ satusehatBusy === 'location' ? 'Sinkron…' : 'Sinkronkan Location' }}
+                </button>
+              </form>
+              <p v-if="satusehatError" class="form-error" role="alert">{{ satusehatError }}</p>
+              <p v-if="satusehatNotice" class="info-note" role="status">{{ satusehatNotice }}</p>
+              <div v-if="satusehat" class="detail-row">
+                <span>Tes terakhir</span>
+                <strong>
+                  {{
+                    satusehat.last_test_at
+                      ? `${satusehat.last_test_ok ? 'Berhasil' : 'Gagal'} · ${timeLabel(satusehat.last_test_at)}`
+                      : 'Belum pernah'
+                  }}
+                </strong>
+              </div>
+              <p v-if="satusehat?.last_test_message" class="info-note">{{ satusehat.last_test_message }}</p>
+              <div v-if="satusehat" class="detail-row">
+                <span>Location ID</span>
+                <strong class="mono">{{ satusehat.location_id || '-' }}</strong>
+              </div>
+            </section>
+
+            <section class="settings-panel">
               <h2>Perangkat &amp; mesin deduplikasi</h2>
               <p>Status pemakaian sumber daya host lokal dan metode pembeda customer vs karyawan.</p>
               <div class="detail-row">
@@ -1257,6 +1528,54 @@ onUnmounted(() => {
                 required
               />
             </div>
+          </div>
+
+          <div class="photo-section">
+            <div class="photo-section-head">
+              <div>
+                <h3>Integrasi SatuSehat</h3>
+                <p>
+                  NIK dienkripsi di database dan hanya dipakai untuk mencari Practitioner. Tidak pernah ditampilkan
+                  utuh.
+                </p>
+              </div>
+              <button
+                v-if="modalEmployee.id"
+                type="button"
+                class="button secondary"
+                :disabled="modalSaving || !modalEmployee.has_nik"
+                @click="syncEmployeeSatuSehat"
+              >
+                Sinkron ke SatuSehat
+              </button>
+            </div>
+            <div class="modal-form-grid">
+              <div>
+                <label for="emp-nik">NIK (16 digit)</label>
+                <input
+                  id="emp-nik"
+                  v-model="modalEmployee.nik"
+                  type="text"
+                  inputmode="numeric"
+                  maxlength="16"
+                  autocomplete="off"
+                  :placeholder="modalEmployee.nik_masked || 'Belum diisi'"
+                />
+              </div>
+              <div>
+                <label for="emp-practitioner">Practitioner ID SatuSehat</label>
+                <input
+                  id="emp-practitioner"
+                  type="text"
+                  readonly
+                  :value="modalEmployee.satusehat_practitioner_id || '-'"
+                />
+              </div>
+            </div>
+            <label v-if="modalEmployee.has_nik" class="checkbox-row">
+              <input v-model="modalEmployee.nik_clear" type="checkbox" />
+              <span>Hapus NIK tersimpan saat menyimpan</span>
+            </label>
           </div>
 
           <label class="checkbox-row">
