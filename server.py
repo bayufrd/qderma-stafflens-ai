@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Literal
 import cv2
 import numpy as np
+import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -96,6 +97,7 @@ _attach_log_filter()
 @app.on_event("startup")
 def _install_log_filter() -> None:
     _attach_log_filter()
+    _start_vision_ai_check()
 
 
 # One process/one camera. Run uvicorn with a single worker; no public network binding.
@@ -121,6 +123,13 @@ _face_analyzer = None
 _restarting = False
 _db_ready = False
 _db_init_lock = threading.Lock()
+_vision_status_lock = threading.Lock()
+_vision_runtime: dict[str, object] = {
+    "status": "checking",
+    "last_checked_at": None,
+    "message": "Pemeriksaan koneksi belum selesai.",
+}
+_vision_check_thread: threading.Thread | None = None
 _ws_waiters: dict[asyncio.Event, tuple[asyncio.AbstractEventLoop, dict[str, object]]] = {}
 
 
@@ -296,15 +305,90 @@ def _today_bounds_utc() -> tuple[datetime, datetime]:
     return start_local.astimezone(timezone.utc), now_local.astimezone(timezone.utc)
 
 
-def _vision_ai_status() -> dict[str, object]:
+def _vision_ai_config() -> tuple[bool, str, str, str]:
     flag = os.getenv("VISION_AI_ENABLED", "auto").strip().lower()
     api_key = os.getenv("VISION_AI_API_KEY", "").strip()
-    base_url = os.getenv("VISION_AI_API_KEY", "") and os.getenv(
+    base_url = os.getenv(
         "VISION_AI_BASE_URL", "https://api.openai.com/v1/chat/completions"
     ).strip()
     model = os.getenv("VISION_AI_MODEL", "gpt-4o-mini").strip()
-    enabled = flag not in {"0", "false", "no", "off"} and bool(api_key and base_url)
-    return {"enabled": enabled, "model": model if enabled else None, "configured": bool(api_key)}
+    enabled = flag not in {"0", "false", "no", "off"}
+    return enabled, api_key, base_url, model
+
+
+def _vision_ai_status() -> dict[str, object]:
+    enabled, api_key, base_url, model = _vision_ai_config()
+    configured = bool(api_key and base_url)
+    with _vision_status_lock:
+        runtime = dict(_vision_runtime)
+    status = runtime["status"] if enabled and configured else ("disabled" if not enabled else "not_configured")
+    return {
+        "enabled": enabled and configured,
+        "configured": configured,
+        "status": status,
+        "model": model if enabled and configured else None,
+        "last_checked_at": runtime["last_checked_at"],
+        "message": runtime["message"] if enabled and configured else (
+            "Vision AI dinonaktifkan melalui konfigurasi." if not enabled else "Isi API key dan endpoint Vision AI di file .env."
+        ),
+    }
+
+
+def _probe_vision_ai() -> None:
+    status, message = "unavailable", "Pemeriksaan endpoint gagal."
+    try:
+        enabled, api_key, base_url, model = _vision_ai_config()
+        if not enabled or not api_key or not base_url:
+            status = "disabled" if not enabled else "not_configured"
+            message = "Vision AI dinonaktifkan." if not enabled else "API key atau endpoint belum diatur."
+        else:
+            response = requests.post(
+                base_url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Reply with OK."}],
+                    "max_tokens": 2,
+                    "temperature": 0,
+                },
+                timeout=(3, 6),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list) or not payload["choices"]:
+                raise ValueError("invalid_response")
+            status, message = "ready", "Endpoint dan model merespons. Fallback gambar belum diuji dengan foto."
+    except requests.Timeout:
+        message = "Waktu koneksi habis saat menghubungi endpoint Vision AI."
+    except requests.HTTPError as exc:
+        code = exc.response.status_code if exc.response is not None else 0
+        if code in (401, 403):
+            message = "Autentikasi ditolak. Periksa API key dan izin model."
+        elif code == 404:
+            message = "Endpoint atau model tidak ditemukan. Periksa URL dan nama model."
+        else:
+            message = f"Endpoint menolak permintaan (HTTP {code})."
+    except (requests.RequestException, ValueError):
+        message = "Tidak dapat terhubung atau respons endpoint tidak valid."
+    except Exception:
+        message = "Pemeriksaan endpoint gagal karena kesalahan internal."
+    with _vision_status_lock:
+        _vision_runtime.update(
+            status=status,
+            last_checked_at=datetime.now(timezone.utc).isoformat(),
+            message=message,
+        )
+
+
+def _start_vision_ai_check() -> bool:
+    global _vision_check_thread
+    with _vision_status_lock:
+        if _vision_check_thread and _vision_check_thread.is_alive():
+            return False
+        _vision_runtime.update(status="checking", message="Sedang menguji endpoint dan model…")
+        _vision_check_thread = threading.Thread(target=_probe_vision_ai, name="vision-ai-healthcheck", daemon=True)
+        _vision_check_thread.start()
+    return True
 
 
 def _password() -> str:
@@ -909,6 +993,29 @@ def update_employee(employee_id: int, body: EmployeeSaveBody) -> dict:
     return _save_employee_and_photos(employee_id, body)
 
 
+@app.delete("/api/employees/{employee_id}", dependencies=[Depends(require_auth), Depends(require_same_origin)])
+def delete_employee(employee_id: int) -> dict:
+    _ensure_db()
+    with SessionLocal() as db:
+        employee = db.get(Employee, employee_id)
+        if employee is None:
+            raise HTTPException(status_code=404, detail="Pegawai tidak ditemukan")
+
+        folder = _resolve_employee_folder(employee.employee_code, employee.name).resolve()
+        root = DB_KARYAWAN_DIR.resolve()
+        if folder != root and root in folder.parents and folder.is_dir():
+            shutil.rmtree(folder)
+
+        # Keep historical camera events, but detach them from the removed employee.
+        db.query(CameraEvent).filter(CameraEvent.employee_id == employee_id).update(
+            {CameraEvent.employee_id: None}, synchronize_session=False
+        )
+        db.delete(employee)
+        _audit(db, "employee_deleted", f"{employee.employee_code}: {employee.name}")
+        db.commit()
+        return {"deleted": True, "employee_id": employee_id}
+
+
 def _audit(db: Session, action: str, detail: str) -> None:
     db.add(AuditLog(action=action, actor="dashboard", detail=detail[:1000]))
 
@@ -1025,6 +1132,12 @@ def satusehat_status() -> dict:
             "location_id",
         )
     }
+
+
+@app.post("/api/vision-ai/test", dependencies=[Depends(require_auth), Depends(require_same_origin)])
+def vision_ai_test() -> dict:
+    _start_vision_ai_check()
+    return _vision_ai_status()
 
 
 @app.post("/api/satusehat/test", dependencies=[Depends(require_auth), Depends(require_same_origin)])

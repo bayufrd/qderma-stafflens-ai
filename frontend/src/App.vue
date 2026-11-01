@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import './style.css'
+import './employee-modal.css'
 
 const authenticated = ref(false)
 const checking = ref(true)
@@ -24,6 +25,7 @@ const satusehatForm = ref({ env: 'dev', client_id: '', organization_id: '', clie
 const satusehatNotice = ref('')
 const satusehatError = ref('')
 const satusehatBusy = ref('')
+const visionAiBusy = ref(false)
 const overview = ref({
   customers_today: 0,
   returning_customers_today: 0,
@@ -34,7 +36,7 @@ const overview = ref({
   events_today: 0,
   events: 0,
   camera_id: 'local-webcam-01',
-  vision_ai: { enabled: false, model: null, configured: false },
+  vision_ai: { enabled: false, model: null, configured: false, status: 'checking', message: '' },
 })
 const visitors = ref([])
 const events = ref([])
@@ -300,6 +302,7 @@ const modalEmployee = ref({
 })
 const photosToDelete = ref([])
 const pendingUploads = ref([])
+const employeeDeleting = ref(false)
 
 const navItems = ['Ringkasan', 'Customer', 'Pegawai', 'Pengaturan']
 
@@ -435,6 +438,18 @@ function saveSatuSehat() {
     )
     satusehatNotice.value = 'Tersimpan. Client Secret terenkripsi di database.'
   })
+}
+
+async function testVisionAi() {
+  visionAiBusy.value = true
+  try {
+    await api('/vision-ai/test', { method: 'POST' })
+    await refresh()
+  } catch (error) {
+    dataError.value = error.message
+  } finally {
+    visionAiBusy.value = false
+  }
 }
 
 function testSatuSehat() {
@@ -623,6 +638,26 @@ async function saveEmployeeModal(reprocessOnly = false) {
     modalError.value = error.message
   } finally {
     modalSaving.value = false
+  }
+}
+
+async function deleteEmployee() {
+  const employee = modalEmployee.value
+  if (!employee.id || employeeDeleting.value || modalSaving.value) return
+  const confirmed = window.confirm(
+    `Hapus pegawai ${employee.name} (${employee.code})? Foto dan data wajahnya akan dihapus permanen. Riwayat kamera tetap disimpan tanpa nama pegawai.`,
+  )
+  if (!confirmed) return
+  employeeDeleting.value = true
+  modalError.value = ''
+  try {
+    await api(`/employees/${employee.id}`, { method: 'DELETE' })
+    showEmployeeModal.value = false
+    await refresh()
+  } catch (error) {
+    modalError.value = error.message
+  } finally {
+    employeeDeleting.value = false
   }
 }
 
@@ -1360,13 +1395,21 @@ if (import.meta.hot) {
               </div>
               <div class="detail-row">
                 <span>Fallback Vision AI (Atribut/Seragam)</span>
-                <strong>
-                  {{
-                    overview.vision_ai?.enabled
-                      ? `Aktif (${overview.vision_ai.model})`
-                      : 'Siap (Isi VISION_AI_API_KEY di .env bila diperlukan)'
-                  }}
-                </strong>
+                <strong>{{ overview.vision_ai?.model || 'Model belum diatur' }}</strong>
+              </div>
+              <div class="vision-status-row">
+                <div>
+                  <span class="vision-status" :class="`is-${overview.vision_ai?.status || 'checking'}`">
+                    {{
+                      ({ ready: 'Tersedia', checking: 'Sedang diuji', unavailable: 'Tidak tersedia', not_configured: 'Belum dikonfigurasi', disabled: 'Dinonaktifkan' })[overview.vision_ai?.status] || 'Belum diuji'
+                    }}
+                  </span>
+                  <small>{{ overview.vision_ai?.message || 'Status koneksi belum diketahui.' }}</small>
+                  <small v-if="overview.vision_ai?.last_checked_at">Tes terakhir: {{ timeLabel(overview.vision_ai.last_checked_at) }}</small>
+                </div>
+                <button class="button secondary" type="button" :disabled="visionAiBusy || overview.vision_ai?.status === 'checking'" @click="testVisionAi">
+                  {{ visionAiBusy ? 'Menguji…' : 'Tes ulang' }}
+                </button>
               </div>
               <div class="detail-row">
                 <span>Prosesor</span>
@@ -1476,18 +1519,17 @@ if (import.meta.hot) {
 
     <!-- Modal Tambah / Edit Pegawai & Galeri Foto db_karyawan -->
     <div v-if="showEmployeeModal" class="modal-backdrop" @click.self="closeEmployeeModal">
-      <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="modal-emp-title">
+      <div class="modal-dialog employee-modal" role="dialog" aria-modal="true" aria-labelledby="modal-emp-title">
         <div class="modal-header">
           <div>
-            <span class="scope-meta">
-              {{ modalEmployee.id ? `ID Pegawai #${modalEmployee.id}` : 'Registrasi Pegawai Baru' }}
+            <span class="scope-meta modal-eyebrow">
+              {{ modalEmployee.id ? `DATA PEGAWAI · #${modalEmployee.id}` : 'REGISTRASI PEGAWAI BARU' }}
             </span>
             <h2 id="modal-emp-title">
               {{ modalEmployee.id ? `Kelola ${modalEmployee.name}` : 'Tambah Pegawai & Foto Wajah' }}
             </h2>
             <p>
-              Folder direktori:
-              <span class="mono">{{ modalEmployee.folder || folderSlugPreview }}</span>
+              {{ modalEmployee.id ? 'Perbarui data pegawai dan foto referensi.' : 'Isi data pegawai, lalu tambahkan foto wajah untuk pengenalan kamera.' }}
             </p>
           </div>
           <button type="button" class="button secondary" :disabled="modalSaving" @click="closeEmployeeModal">
@@ -1495,10 +1537,16 @@ if (import.meta.hot) {
           </button>
         </div>
 
-        <form class="modal-body" @submit.prevent="saveEmployeeModal(false)">
+        <form class="modal-body employee-modal-body" @submit.prevent="saveEmployeeModal(false)">
+          <div class="modal-key" aria-label="Penanda isian">
+            <span><b class="required-mark">*</b> Wajib diisi</span>
+            <span>Opsional boleh dikosongkan</span>
+          </div>
+          <section class="employee-fields-section">
+            <div class="employee-section-title"><span>01</span><div><h3>Data pegawai</h3><p>Informasi dasar untuk daftar karyawan.</p></div></div>
           <div class="modal-form-grid">
             <div>
-              <label for="emp-code">Kode pegawai</label>
+              <label for="emp-code">Kode pegawai <b class="required-mark">*</b></label>
               <input
                 id="emp-code"
                 v-model="modalEmployee.code"
@@ -1508,7 +1556,7 @@ if (import.meta.hot) {
               />
             </div>
             <div>
-              <label for="emp-name">Nama lengkap</label>
+              <label for="emp-name">Nama lengkap <b class="required-mark">*</b></label>
               <input
                 id="emp-name"
                 v-model="modalEmployee.name"
@@ -1518,7 +1566,7 @@ if (import.meta.hot) {
               />
             </div>
             <div>
-              <label for="emp-role">Peran / jabatan</label>
+              <label for="emp-role">Peran / jabatan <b class="required-mark">*</b></label>
               <input
                 id="emp-role"
                 v-model="modalEmployee.role"
@@ -1528,11 +1576,12 @@ if (import.meta.hot) {
               />
             </div>
           </div>
+          </section>
 
-          <div class="photo-section">
+          <div class="photo-section employee-section">
             <div class="photo-section-head">
               <div>
-                <h3>Integrasi SatuSehat</h3>
+                <h3>Data SatuSehat <span class="optional-mark">Opsional</span></h3>
                 <p>
                   NIK dienkripsi di database dan hanya dipakai untuk mencari Practitioner. Tidak pernah ditampilkan
                   utuh.
@@ -1550,7 +1599,7 @@ if (import.meta.hot) {
             </div>
             <div class="modal-form-grid">
               <div>
-                <label for="emp-nik">NIK (16 digit)</label>
+                <label for="emp-nik">NIK <span class="optional-mark">Opsional · 16 digit</span></label>
                 <input
                   id="emp-nik"
                   v-model="modalEmployee.nik"
@@ -1562,7 +1611,7 @@ if (import.meta.hot) {
                 />
               </div>
               <div>
-                <label for="emp-practitioner">Practitioner ID SatuSehat</label>
+                <label for="emp-practitioner">ID Practitioner <span class="optional-mark">Otomatis</span></label>
                 <input
                   id="emp-practitioner"
                   type="text"
@@ -1582,13 +1631,12 @@ if (import.meta.hot) {
             <span>Pegawai aktif (dikenali kamera &amp; dikecualikan dari hitungan customer)</span>
           </label>
 
-          <div class="photo-section">
+          <div class="photo-section employee-section">
             <div class="photo-section-head">
               <div>
-                <h3>Galeri foto di {{ modalEmployee.folder || folderSlugPreview }}</h3>
+                <h3>Foto referensi <b v-if="!modalEmployee.id" class="required-mark">*</b><span v-else class="optional-mark">Opsional</span></h3>
                 <p>
-                  Gunakan 3–5 foto wajah terang (tepat 1 wajah per foto). Saat disimpan, InsightFace otomatis membuat
-                  vektor 512-D ke PostgreSQL.
+                  {{ modalEmployee.id ? 'Tambahkan foto baru atau tandai foto lama yang ingin dihapus.' : 'Minimal 1 foto wajib. Gunakan wajah terang, satu orang per foto; disarankan 3–5 foto.' }}
                 </p>
               </div>
               <label class="button secondary upload-trigger">
@@ -1659,9 +1707,12 @@ if (import.meta.hot) {
           <p v-if="modalError" class="form-error" role="alert">{{ modalError }}</p>
           <p v-if="modalNotice" class="info-note modal-success" role="status">{{ modalNotice }}</p>
 
-          <div class="modal-footer">
-            <span class="scope-meta">
-              {{ modalEmployee.embeddings || 0 }} vektor aktif di DB · {{ pendingUploads.length }} foto baru siap diunggah
+          <div class="modal-footer employee-modal-footer">
+            <button v-if="modalEmployee.id" type="button" class="button danger-button" :disabled="modalSaving || employeeDeleting" @click="deleteEmployee">
+              {{ employeeDeleting ? 'Menghapus…' : 'Hapus pegawai' }}
+            </button>
+            <span class="scope-meta employee-save-summary">
+              {{ modalEmployee.embeddings || 0 }} vektor · {{ pendingUploads.length }} foto baru
             </span>
             <div class="modal-actions">
               <button
@@ -1673,7 +1724,7 @@ if (import.meta.hot) {
               >
                 Ekstrak ulang vektor
               </button>
-              <button type="submit" class="button primary" :disabled="modalSaving">
+              <button type="submit" class="button primary" :disabled="modalSaving || employeeDeleting">
                 {{
                   modalSaving
                     ? 'Menyimpan & mengekstrak wajah…'
