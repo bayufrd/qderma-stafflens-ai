@@ -1276,79 +1276,78 @@ if (import.meta.hot) {
               <p v-if="settingsNotice" class="info-note" role="status">{{ settingsNotice }}</p>
             </section>
 
-            <section class="settings-panel">
-              <h2>Integrasi SatuSehat</h2>
-              <p>
-                Kredensial disimpan di database; Client Secret dienkripsi dan tidak pernah dikirim kembali ke browser.
-              </p>
-              <p v-if="satusehat && !satusehat.encryption_key_configured" class="form-error">
-                SATUSEHAT_ENCRYPTION_KEY belum diisi di .env, jadi Client Secret belum bisa disimpan.
-              </p>
-              <form class="settings-form" autocomplete="off" @submit.prevent="saveSatuSehat">
-                <label for="ss-env">Lingkungan</label>
-                <select id="ss-env" v-model="satusehatForm.env">
-                  <option value="dev">Dev (sandbox)</option>
-                  <option value="staging">Staging</option>
-                  <option value="production">Production</option>
-                </select>
-                <span v-if="satusehat" class="scope-meta mono">{{ satusehat.environments[satusehatForm.env] }}</span>
-                <label for="ss-client-id">Client ID</label>
-                <input id="ss-client-id" v-model="satusehatForm.client_id" type="text" autocomplete="off" />
-                <label for="ss-client-secret">Client Secret</label>
-                <input
-                  id="ss-client-secret"
-                  v-model="satusehatForm.client_secret"
-                  type="password"
-                  autocomplete="new-password"
-                  :placeholder="satusehat?.client_secret_masked || 'Belum diisi'"
-                />
-                <span class="scope-meta">Kosongkan untuk mempertahankan secret yang tersimpan.</span>
-                <label for="ss-org">Organization ID</label>
-                <input id="ss-org" v-model="satusehatForm.organization_id" type="text" autocomplete="off" />
-                <label for="ss-location">Nama lokasi kamera (ruangan)</label>
-                <input
-                  id="ss-location"
-                  v-model="satusehatForm.location_name"
-                  type="text"
-                  placeholder="Mis. Lobi QDerma"
-                />
-                <button class="button primary" type="submit" :disabled="Boolean(satusehatBusy)">
-                  {{ satusehatBusy === 'save' ? 'Menyimpan…' : 'Simpan kredensial' }}
-                  <span aria-hidden="true">→</span>
-                </button>
-                <button
-                  class="button secondary"
-                  type="button"
-                  :disabled="Boolean(satusehatBusy) || !satusehat?.has_client_secret"
-                  @click="testSatuSehat"
-                >
-                  {{ satusehatBusy === 'test' ? 'Menguji…' : 'Tes koneksi' }}
-                </button>
-                <button
-                  class="button secondary"
-                  type="button"
-                  :disabled="Boolean(satusehatBusy) || !satusehat?.has_client_secret"
-                  @click="syncSatuSehatLocation"
-                >
-                  {{ satusehatBusy === 'location' ? 'Sinkron…' : 'Sinkronkan Location' }}
-                </button>
-              </form>
-              <p v-if="satusehatError" class="form-error" role="alert">{{ satusehatError }}</p>
-              <p v-if="satusehatNotice" class="info-note" role="status">{{ satusehatNotice }}</p>
-              <div v-if="satusehat" class="detail-row">
-                <span>Tes terakhir</span>
-                <strong>
-                  {{
-                    satusehat.last_test_at
-                      ? `${satusehat.last_test_ok ? 'Berhasil' : 'Gagal'} · ${timeLabel(satusehat.last_test_at)}`
-                      : 'Belum pernah'
-                  }}
-                </strong>
+            <section class="settings-panel satusehat-panel">
+              <div class="satusehat-intro">
+                <h2>Integrasi SatuSehat</h2>
+                <p>Hubungkan fasilitas ke lingkungan SatuSehat. Mulai dari kredensial sandbox; gunakan production hanya setelah proses uji dan persetujuan selesai.</p>
+                <ol class="satusehat-steps">
+                  <li><span>1</span><div><strong>Daftar aplikasi</strong><small>Portal Developer SATUSEHAT → buat aplikasi, lalu pilih lingkungan yang sesuai.</small></div></li>
+                  <li><span>2</span><div><strong>Masukkan ID fasilitas</strong><small>Organization ID berasal dari data organisasi/fasilitas yang terdaftar di SATUSEHAT.</small></div></li>
+                  <li><span>3</span><div><strong>Simpan dan verifikasi</strong><small>Tes koneksi harus berhasil sebelum sinkronisasi Location atau Practitioner.</small></div></li>
+                </ol>
+                <a class="satusehat-doc-link" href="https://satusehat.kemkes.go.id/platform" target="_blank" rel="noopener noreferrer">Buka Portal Developer SATUSEHAT <span aria-hidden="true">↗</span></a>
+                <p class="satusehat-security">Client Secret terenkripsi di database. Kunci enkripsi disimpan di <code>.env</code> dan tidak boleh hilang.</p>
               </div>
-              <p v-if="satusehat?.last_test_message" class="info-note">{{ satusehat.last_test_message }}</p>
-              <div v-if="satusehat" class="detail-row">
-                <span>Location ID</span>
-                <strong class="mono">{{ satusehat.location_id || '-' }}</strong>
+              <div class="satusehat-config">
+                <p v-if="satusehat && !satusehat.encryption_key_configured" class="form-error" role="alert">
+                  <code>SATUSEHAT_ENCRYPTION_KEY</code> belum diisi di <code>.env</code>. Isi kunci Fernet dan restart server sebelum menyimpan secret.
+                </p>
+                <form class="settings-form satusehat-form" autocomplete="off" @submit.prevent="saveSatuSehat">
+                  <div class="ss-field ss-field-wide">
+                    <label for="ss-env">Lingkungan SATUSEHAT</label>
+                    <select id="ss-env" v-model="satusehatForm.env">
+                      <option value="dev">Dev — sandbox</option>
+                      <option value="staging">Staging — pra-produksi</option>
+                      <option value="production">Production — layanan aktif</option>
+                    </select>
+                    <small>Harus sama dengan lingkungan tempat aplikasi dan kredensial dibuat.</small>
+                    <code v-if="satusehat" class="ss-endpoint">{{ satusehat.environments[satusehatForm.env] }}</code>
+                  </div>
+                  <div class="ss-field">
+                    <label for="ss-client-id">Client ID</label>
+                    <input id="ss-client-id" v-model="satusehatForm.client_id" type="text" autocomplete="off" />
+                    <small>Identitas aplikasi. Salin dari detail aplikasi di Portal Developer SATUSEHAT.</small>
+                  </div>
+                  <div class="ss-field">
+                    <label for="ss-client-secret">Client Secret</label>
+                    <input
+                      id="ss-client-secret"
+                      v-model="satusehatForm.client_secret"
+                      type="password"
+                      autocomplete="new-password"
+                      :placeholder="satusehat?.client_secret_masked || 'Masukkan secret aplikasi'"
+                    />
+                    <small>Rahasia aplikasi dari portal yang sama. Kosongkan untuk mempertahankan secret tersimpan.</small>
+                  </div>
+                  <div class="ss-field">
+                    <label for="ss-org">Organization ID</label>
+                    <input id="ss-org" v-model="satusehatForm.organization_id" type="text" autocomplete="off" />
+                    <small>ID organisasi/fasilitas kesehatan yang sudah terdaftar di SATUSEHAT, bukan Client ID.</small>
+                  </div>
+                  <div class="ss-field">
+                    <label for="ss-location">Nama lokasi kamera</label>
+                    <input id="ss-location" v-model="satusehatForm.location_name" type="text" placeholder="Mis. Ruang konsultasi 1" />
+                    <small>Nama ruangan fisik; Location ID akan dibuat/ditemukan saat disinkronkan.</small>
+                  </div>
+                  <div class="ss-actions ss-field-wide">
+                    <button class="button primary" type="submit" :disabled="Boolean(satusehatBusy) || (satusehat && !satusehat.encryption_key_configured)">
+                      {{ satusehatBusy === 'save' ? 'Menyimpan…' : 'Simpan pengaturan' }}
+                    </button>
+                    <button class="button secondary" type="button" :disabled="Boolean(satusehatBusy) || !satusehat?.has_client_secret" @click="testSatuSehat">
+                      {{ satusehatBusy === 'test' ? 'Menguji…' : 'Tes koneksi' }}
+                    </button>
+                    <button class="button secondary" type="button" :disabled="Boolean(satusehatBusy) || !satusehat?.has_client_secret" @click="syncSatuSehatLocation">
+                      {{ satusehatBusy === 'location' ? 'Sinkron…' : 'Sinkronkan Location' }}
+                    </button>
+                  </div>
+                </form>
+                <p v-if="satusehatError" class="form-error" role="alert">{{ satusehatError }}</p>
+                <p v-if="satusehatNotice" class="info-note" role="status">{{ satusehatNotice }}</p>
+                <div v-if="satusehat" class="ss-connection-state">
+                  <div><span>Tes koneksi terakhir</span><strong>{{ satusehat.last_test_at ? `${satusehat.last_test_ok ? 'Berhasil' : 'Gagal'} · ${timeLabel(satusehat.last_test_at)}` : 'Belum pernah diuji' }}</strong></div>
+                  <div><span>Location ID</span><strong class="mono">{{ satusehat.location_id || 'Belum disinkronkan' }}</strong></div>
+                  <p v-if="satusehat.last_test_message">{{ satusehat.last_test_message }}</p>
+                </div>
               </div>
             </section>
 
