@@ -86,6 +86,20 @@ class DailyVisitor(Base):
         nullable=True,
         index=True,
     )
+    review_status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+
+
+class VisitorFeedback(Base):
+    __tablename__ = "visitor_feedback"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    visitor_id: Mapped[int] = mapped_column(ForeignKey("daily_visitors.id", ondelete="CASCADE"), index=True)
+    reason_code: Mapped[str] = mapped_column(String(64))
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    predicted_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_by: Mapped[str] = mapped_column(String(255), default="dashboard")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    undone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AuditLog(Base):
@@ -130,6 +144,10 @@ class SatuSehatSettings(Base):
 
 
 # Columns added after the first release; create_all() does not alter existing tables.
+_DAILY_VISITOR_NEW_COLUMNS = {
+    "review_status": "VARCHAR(32) DEFAULT 'active'",
+}
+
 _EMPLOYEE_NEW_COLUMNS = {
     "nik_encrypted": "TEXT",
     "nik_last4": "VARCHAR(4)",
@@ -138,9 +156,9 @@ _EMPLOYEE_NEW_COLUMNS = {
 }
 
 
-def _migrate_employee_columns() -> None:
-    existing = {col["name"] for col in inspect(engine).get_columns("employees")}
-    missing = {name: ddl for name, ddl in _EMPLOYEE_NEW_COLUMNS.items() if name not in existing}
+def _migrate_columns(table: str, definitions: dict[str, str]) -> None:
+    existing = {col["name"] for col in inspect(engine).get_columns(table)}
+    missing = {name: ddl for name, ddl in definitions.items() if name not in existing}
     if not missing:
         return
     is_mysql = engine.dialect.name == "mysql"
@@ -148,7 +166,11 @@ def _migrate_employee_columns() -> None:
         for name, ddl in missing.items():
             if is_mysql and ddl.startswith("TIMESTAMP"):
                 ddl = "DATETIME"
-            conn.execute(text(f"ALTER TABLE employees ADD COLUMN {name} {ddl}"))
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+
+
+def _migrate_employee_columns() -> None:
+    _migrate_columns("employees", _EMPLOYEE_NEW_COLUMNS)
 
 
 def initialize_database() -> None:
@@ -159,6 +181,7 @@ def initialize_database() -> None:
         if "customer_min_dwell_seconds" not in columns:
             connection.execute(text("ALTER TABLE camera_settings ADD COLUMN customer_min_dwell_seconds FLOAT DEFAULT 0.5"))
     _migrate_employee_columns()
+    _migrate_columns("daily_visitors", _DAILY_VISITOR_NEW_COLUMNS)
 
 
 if __name__ == "__main__":

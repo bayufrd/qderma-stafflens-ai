@@ -33,6 +33,7 @@ import satusehat
 from database import (
     AuditLog,
     CameraEvent,
+    VisitorFeedback,
     CameraSettings,
     DailyVisitor,
     Employee,
@@ -319,6 +320,11 @@ def _decode_data_url(data_url: str) -> bytes:
 
 class LoginBody(BaseModel):
     password: str
+
+
+class VisitorReviewBody(BaseModel):
+    reason_code: Literal["not_person", "bad_crop", "object", "blur", "duplicate", "employee", "other"]
+    note: str | None = Field(default=None, max_length=500)
 
 
 class CameraSettingsBody(BaseModel):
@@ -655,6 +661,7 @@ def _query_overview(db: Session) -> dict:
             select(func.count(DailyVisitor.id)).where(
                 DailyVisitor.visit_date == today_date,
                 DailyVisitor.reclassified_employee_id.is_(None),
+                DailyVisitor.review_status == "active",
             )
         )
         or 0
@@ -664,6 +671,7 @@ def _query_overview(db: Session) -> dict:
             select(func.count(DailyVisitor.id)).where(
                 DailyVisitor.visit_date == today_date,
                 DailyVisitor.reclassified_employee_id.is_(None),
+                DailyVisitor.review_status == "active",
                 DailyVisitor.visit_count > 1,
             )
         )
@@ -674,6 +682,7 @@ def _query_overview(db: Session) -> dict:
             select(func.coalesce(func.sum(DailyVisitor.visit_count), 0)).where(
                 DailyVisitor.visit_date == today_date,
                 DailyVisitor.reclassified_employee_id.is_(None),
+                DailyVisitor.review_status == "active",
             )
         )
         or 0
@@ -715,6 +724,7 @@ def _query_visitors(db: Session, limit: int = 50) -> dict:
         .where(
             DailyVisitor.visit_date == today_date,
             DailyVisitor.reclassified_employee_id.is_(None),
+            DailyVisitor.review_status == "active",
         )
         .order_by(DailyVisitor.last_seen_at.desc(), DailyVisitor.id.desc())
         .limit(max(1, min(limit, 200)))
@@ -734,6 +744,7 @@ def _query_visitors(db: Session, limit: int = 50) -> dict:
                 "attributes": row.attributes_summary or ("Wajah + Pakaian" if row.face_vector else "Pola Pakaian"),
                 "confidence": row.confidence,
                 "photo_count": _customer_photo_count(row.visitor_code),
+                "review_status": row.review_status,
             }
         )
     return {"items": items, "date": today_date.isoformat()}
@@ -893,6 +904,28 @@ def visitor_photo(visitor_id: int, filename: str) -> Response:
     if file_path.parent != folder or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Foto customer tidak ditemukan")
     return FileResponse(file_path, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/visitors/{visitor_id}/review", dependencies=[Depends(require_auth), Depends(require_same_origin)])
+def review_visitor(visitor_id: int, body: VisitorReviewBody) -> dict:
+    _ensure_db()
+    with SessionLocal() as db:
+        visitor = db.get(DailyVisitor, visitor_id)
+        if visitor is None or visitor.reclassified_employee_id is not None:
+            raise HTTPException(status_code=404, detail="Customer tidak ditemukan")
+        visitor.review_status = "duplicate" if body.reason_code == "duplicate" else "false_positive"
+        db.add(VisitorFeedback(visitor_id=visitor.id, reason_code=body.reason_code, note=body.note, predicted_kind="customer"))
+        db.query(CameraEvent).filter(
+            CameraEvent.metadata_json["visitor_id"].as_integer() == visitor.id,
+            CameraEvent.event_type.in_(["customer_new", "customer_return"]),
+        ).update({"event_type": "customer_reviewed", "metadata_json": {"kind": "false_positive", "visitor_id": visitor.id, "reason_code": body.reason_code}}, synchronize_session=False)
+        _audit(db, "visitor_reviewed", f"{visitor.visitor_code}: {visitor.review_status}; reason={body.reason_code}; note={body.note or ''}")
+        folder = _customer_folder(visitor.visitor_code).resolve()
+        root = DB_CUSTOMER_DIR.resolve()
+        if folder != root and root in folder.parents:
+            shutil.rmtree(folder, ignore_errors=True)
+        db.commit()
+        return {"reviewed": True, "visitor_id": visitor.id, "status": visitor.review_status}
 
 
 @app.get("/api/visitors", dependencies=[Depends(require_auth)])

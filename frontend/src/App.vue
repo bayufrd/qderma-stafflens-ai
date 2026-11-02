@@ -308,6 +308,11 @@ const cameraVideoRef = ref(null)
 const cameraCaptureOpen = ref(false)
 const employeeDeleting = ref(false)
 const customerPhotoModal = ref({ open: false, customer: null, photos: [], loading: false, error: '' })
+const customerReview = ref({ open: false, customer: null, reason: '', note: '', busy: false, error: '' })
+const reviewReasons = [
+  ['not_person', 'Bukan orang'], ['bad_crop', 'Crop salah'], ['object', 'Tangan / jam / objek'],
+  ['blur', 'Foto blur'], ['duplicate', 'Duplikat customer'], ['employee', 'Salah klasifikasi karyawan'], ['other', 'Lainnya'],
+]
 
 const navItems = ['Ringkasan', 'Customer', 'Pegawai', 'Pengaturan']
 
@@ -784,6 +789,29 @@ async function openCustomerPhotos(customer) {
 
 function closeCustomerPhotos() {
   customerPhotoModal.value = { open: false, customer: null, photos: [], loading: false, error: '' }
+}
+
+function openCustomerReview(customer) {
+  customerReview.value = { open: true, customer, reason: '', note: '', busy: false, error: '' }
+}
+
+async function submitCustomerReview() {
+  const review = customerReview.value
+  if (!review.reason || review.busy) return
+  review.busy = true
+  try {
+    await api(`/visitors/${review.customer.id}/review`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason_code: review.reason, note: review.note || null }),
+    })
+    customerReview.value.open = false
+    closeCustomerPhotos()
+    await refresh()
+  } catch (error) {
+    review.error = error.message
+  } finally {
+    review.busy = false
+  }
 }
 
 const filteredVisitors = computed(() =>
@@ -1591,7 +1619,10 @@ if (import.meta.hot) {
             <h2 id="customer-photo-title">{{ customerPhotoModal.customer?.label }} · {{ customerPhotoModal.customer?.code }}</h2>
             <p>Snapshot crop customer terpilih berdasarkan ketajaman gambar. Tersimpan lokal di db_customer/.</p>
           </div>
-          <button type="button" class="button secondary" @click="closeCustomerPhotos">Tutup</button>
+          <div class="modal-actions">
+            <button type="button" class="button danger-button" @click="openCustomerReview(customerPhotoModal.customer)">Tandai salah / Hapus</button>
+            <button type="button" class="button secondary" @click="closeCustomerPhotos">Tutup</button>
+          </div>
         </div>
         <div class="customer-photo-grid">
           <p v-if="customerPhotoModal.loading" class="empty-state">Memuat snapshot…</p>
@@ -1605,6 +1636,18 @@ if (import.meta.hot) {
             loading="lazy"
           />
         </div>
+      </div>
+    </div>
+
+    <div v-if="customerReview.open" class="modal-backdrop" @click.self="customerReview.open = false">
+      <div class="modal-dialog" role="dialog" aria-modal="true">
+        <div class="modal-header"><div><span class="scope-meta modal-eyebrow">VALIDASI CUSTOMER</span><h2>Tandai salah / Hapus</h2><p>Pilih alasan. Feedback tersimpan di PostgreSQL.</p></div><button class="button secondary" @click="customerReview.open = false">Tutup</button></div>
+        <div class="review-reasons">
+          <button v-for="item in reviewReasons" :key="item[0]" type="button" class="button" :class="customerReview.reason === item[0] ? 'primary' : 'secondary'" @click="customerReview.reason = item[0]">{{ item[1] }}</button>
+        </div>
+        <textarea v-if="customerReview.reason === 'other'" v-model="customerReview.note" rows="3" placeholder="Catatan opsional"></textarea>
+        <p v-if="customerReview.error" class="form-error">{{ customerReview.error }}</p>
+        <button type="button" class="button danger-button" :disabled="!customerReview.reason || customerReview.busy" @click="submitCustomerReview">{{ customerReview.busy ? 'Menyimpan…' : 'Konfirmasi hapus' }}</button>
       </div>
     </div>
 
