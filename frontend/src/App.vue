@@ -308,6 +308,8 @@ const cameraVideoRef = ref(null)
 const cameraCaptureOpen = ref(false)
 const employeeDeleting = ref(false)
 const customerPhotoModal = ref({ open: false, customer: null, photos: [], loading: false, error: '' })
+const showReviewed = ref(false)
+const reviewedVisitors = ref([])
 const customerReview = ref({ open: false, customer: null, reason: '', note: '', busy: false, error: '' })
 const reviewReasons = [
   ['not_person', 'Bukan orang'], ['bad_crop', 'Crop salah'], ['object', 'Tangan / jam / objek'],
@@ -814,6 +816,23 @@ async function submitCustomerReview() {
   }
 }
 
+async function loadReviewed() {
+  if (!showReviewed.value) return
+  const result = await api('/visitors?include_reviewed=true')
+  reviewedVisitors.value = result.items || []
+}
+
+async function restoreReviewed(customer) {
+  await api(`/visitors/${customer.id}/restore`, { method: 'POST' })
+  await loadReviewed(); await refresh()
+}
+
+async function permanentlyDeleteReviewed(customer) {
+  if (!window.confirm(`Hapus permanen ${customer.code}?`)) return
+  await api(`/visitors/${customer.id}`, { method: 'DELETE' })
+  await loadReviewed()
+}
+
 const filteredVisitors = computed(() =>
   visitors.value.filter(item =>
     `${item.label} ${item.code} ${item.attributes || ''}`.toLowerCase().includes(search.value.toLowerCase()),
@@ -1246,6 +1265,9 @@ if (import.meta.hot) {
 
           <template v-if="activityTab === 'visitors'">
             <div class="list-toolbar">
+              <button type="button" class="button secondary" @click="showReviewed = !showReviewed; loadReviewed()">{{ showReviewed ? 'Sembunyikan arsip salah' : 'Tampilkan arsip salah' }}</button>
+            </div>
+            <div class="list-toolbar">
               <div>
                 <h2>Registri customer unik hari ini</h2>
                 <p>
@@ -1255,7 +1277,14 @@ if (import.meta.hot) {
               </div>
               <input v-model="search" type="search" placeholder="Cari ID atau ciri pakaian" aria-label="Cari customer" />
             </div>
-            <div v-if="!filteredVisitors.length" class="empty-state">
+            <div v-if="showReviewed && reviewedVisitors.length" class="data-table">
+              <div class="table-row table-head"><span>Arsip validasi</span><span>Status</span><span></span><span class="right">Aksi</span></div>
+              <div v-for="vis in reviewedVisitors" :key="`review-${vis.id}`" class="table-row">
+                <strong>{{ vis.label }}<small class="mono">{{ vis.code }}</small></strong><span>{{ vis.review_status }}</span><span></span>
+                <span class="right"><button class="text-button" @click="restoreReviewed(vis)">Pulihkan</button><button class="text-button danger-text" @click="permanentlyDeleteReviewed(vis)">Hapus permanen</button></span>
+              </div>
+            </div>
+            <div v-if="!showReviewed && !filteredVisitors.length" class="empty-state">
               {{ search ? 'Tidak ada customer yang cocok dengan pencarian.' : 'Belum ada customer tercatat hari ini.' }}
             </div>
             <div v-else class="data-table">

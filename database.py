@@ -97,6 +97,7 @@ class VisitorFeedback(Base):
     reason_code: Mapped[str] = mapped_column(String(64))
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     predicted_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    embedding_snapshot: Mapped[list[float] | None] = mapped_column(JSONB, nullable=True)
     created_by: Mapped[str] = mapped_column(String(255), default="dashboard")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
     undone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -156,6 +157,9 @@ _EMPLOYEE_NEW_COLUMNS = {
 }
 
 
+_FEEDBACK_NEW_COLUMNS = {"embedding_snapshot": "JSONB"}
+
+
 def _migrate_columns(table: str, definitions: dict[str, str]) -> None:
     existing = {col["name"] for col in inspect(engine).get_columns(table)}
     missing = {name: ddl for name, ddl in definitions.items() if name not in existing}
@@ -182,6 +186,7 @@ def initialize_database() -> None:
             connection.execute(text("ALTER TABLE camera_settings ADD COLUMN customer_min_dwell_seconds FLOAT DEFAULT 0.5"))
     _migrate_employee_columns()
     _migrate_columns("daily_visitors", _DAILY_VISITOR_NEW_COLUMNS)
+    _migrate_columns("visitor_feedback", _FEEDBACK_NEW_COLUMNS)
 
 
 if __name__ == "__main__":

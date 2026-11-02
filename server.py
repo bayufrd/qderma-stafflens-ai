@@ -327,6 +327,10 @@ class VisitorReviewBody(BaseModel):
     note: str | None = Field(default=None, max_length=500)
 
 
+class VisitorMergeBody(BaseModel):
+    target_visitor_id: int
+
+
 class CameraSettingsBody(BaseModel):
     video_source: int = Field(ge=0, le=8)
     performance_level: int = Field(ge=1, le=5)
@@ -717,6 +721,11 @@ def _query_overview(db: Session) -> dict:
     }
 
 
+def _query_reviewed_visitors(db: Session, limit: int = 50) -> dict:
+    rows = db.scalars(select(DailyVisitor).where(DailyVisitor.review_status != "active").order_by(DailyVisitor.id.desc()).limit(max(1, min(limit, 200)))).all()
+    return {"items": [{"id": r.id, "code": r.visitor_code, "label": f"Customer #{r.visitor_code.rsplit('-', 1)[-1]}", "review_status": r.review_status, "visit_count": r.visit_count, "attributes": r.attributes_summary, "photo_count": _customer_photo_count(r.visitor_code)} for r in rows]}
+
+
 def _query_visitors(db: Session, limit: int = 50) -> dict:
     today_date = datetime.now().astimezone().date()
     rows = db.scalars(
@@ -914,7 +923,7 @@ def review_visitor(visitor_id: int, body: VisitorReviewBody) -> dict:
         if visitor is None or visitor.reclassified_employee_id is not None:
             raise HTTPException(status_code=404, detail="Customer tidak ditemukan")
         visitor.review_status = "duplicate" if body.reason_code == "duplicate" else "false_positive"
-        db.add(VisitorFeedback(visitor_id=visitor.id, reason_code=body.reason_code, note=body.note, predicted_kind="customer"))
+        db.add(VisitorFeedback(visitor_id=visitor.id, reason_code=body.reason_code, note=body.note, predicted_kind="customer", embedding_snapshot=visitor.face_vector))
         db.query(CameraEvent).filter(
             CameraEvent.metadata_json["visitor_id"].as_integer() == visitor.id,
             CameraEvent.event_type.in_(["customer_new", "customer_return"]),
@@ -928,10 +937,62 @@ def review_visitor(visitor_id: int, body: VisitorReviewBody) -> dict:
         return {"reviewed": True, "visitor_id": visitor.id, "status": visitor.review_status}
 
 
-@app.get("/api/visitors", dependencies=[Depends(require_auth)])
-def visitors(limit: int = 50) -> dict:
+@app.post("/api/visitors/{visitor_id}/restore", dependencies=[Depends(require_auth), Depends(require_same_origin)])
+def restore_visitor(visitor_id: int) -> dict:
     _ensure_db()
     with SessionLocal() as db:
+        visitor = db.get(DailyVisitor, visitor_id)
+        if visitor is None:
+            raise HTTPException(status_code=404, detail="Customer tidak ditemukan")
+        visitor.review_status = "active"
+        db.query(VisitorFeedback).filter(VisitorFeedback.visitor_id == visitor_id, VisitorFeedback.undone_at.is_(None)).update({"undone_at": datetime.now(timezone.utc)}, synchronize_session=False)
+        _audit(db, "visitor_restored", visitor.visitor_code)
+        db.commit()
+        return {"restored": True, "visitor_id": visitor_id}
+
+
+@app.delete("/api/visitors/{visitor_id}", dependencies=[Depends(require_auth), Depends(require_same_origin)])
+def hard_delete_visitor(visitor_id: int) -> dict:
+    _ensure_db()
+    with SessionLocal() as db:
+        visitor = db.get(DailyVisitor, visitor_id)
+        if visitor is None:
+            raise HTTPException(status_code=404, detail="Customer tidak ditemukan")
+        code = visitor.visitor_code
+        db.delete(visitor)
+        _audit(db, "visitor_deleted_permanently", code)
+        db.commit()
+    shutil.rmtree(_customer_folder(code), ignore_errors=True)
+    return {"deleted": True, "visitor_id": visitor_id}
+
+
+@app.post("/api/visitors/{visitor_id}/merge", dependencies=[Depends(require_auth), Depends(require_same_origin)])
+def merge_visitor(visitor_id: int, body: VisitorMergeBody) -> dict:
+    if visitor_id == body.target_visitor_id:
+        raise HTTPException(status_code=400, detail="Target merge tidak valid")
+    _ensure_db()
+    with SessionLocal() as db:
+        source, target = db.get(DailyVisitor, visitor_id), db.get(DailyVisitor, body.target_visitor_id)
+        if source is None or target is None or source.visit_date != target.visit_date:
+            raise HTTPException(status_code=404, detail="Customer merge tidak ditemukan")
+        target.visit_count += source.visit_count
+        target.face_vector = target.face_vector or source.face_vector
+        target.body_vector = target.body_vector or source.body_vector
+        db.query(CameraEvent).filter(CameraEvent.metadata_json["visitor_id"].as_integer() == source.id).update({"metadata_json": {"visitor_id": target.id, "kind": "customer", "merged_from": source.id}}, synchronize_session=False)
+        source.review_status = "duplicate"
+        db.add(VisitorFeedback(visitor_id=source.id, reason_code="duplicate", note=f"merged_to:{target.id}", predicted_kind="customer", embedding_snapshot=source.face_vector))
+        _audit(db, "visitor_merged", f"{source.visitor_code} -> {target.visitor_code}")
+        db.commit()
+    shutil.rmtree(_customer_folder(source.visitor_code), ignore_errors=True)
+    return {"merged": True, "source_id": visitor_id, "target_id": target.id}
+
+
+@app.get("/api/visitors", dependencies=[Depends(require_auth)])
+def visitors(limit: int = 50, include_reviewed: bool = False) -> dict:
+    _ensure_db()
+    with SessionLocal() as db:
+        if include_reviewed:
+            return _query_reviewed_visitors(db, limit=limit)
         return _query_visitors(db, limit=limit)
 
 
