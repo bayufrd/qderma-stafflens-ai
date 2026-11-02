@@ -46,6 +46,7 @@ EMPLOYEE_REFRESH_SECONDS = max(1, int(os.getenv("EMPLOYEE_REFRESH_SECONDS", "15"
 VISION_AI_BASE_URL = os.getenv("VISION_AI_BASE_URL", "https://api.openai.com/v1/chat/completions").strip()
 VISION_AI_API_KEY = os.getenv("VISION_AI_API_KEY", "").strip()
 VISION_AI_MODEL = os.getenv("VISION_AI_MODEL", "gpt-4o-mini").strip()
+VISION_AI_TIMEOUT_SECONDS = min(300, max(120, int(os.getenv("VISION_AI_TIMEOUT_SECONDS", "120"))))
 VISION_AI_STAFF_HINT = os.getenv(
     "VISION_AI_STAFF_HINT",
     "Staf klinik QDerma memakai seragam kerja klinik (scrub/tunik medis), jas dokter putih, atau lanyard ID card. "
@@ -287,9 +288,14 @@ def blend_vectors(old_vec: np.ndarray | None, new_vec: np.ndarray | None, alpha:
     return normalized((1.0 - alpha) * old_vec + alpha * new_vec)
 
 
+def _staff_camera_label(employee: Employee) -> str:
+    code = employee.employee_code.upper().removeprefix("EMP-")
+    return f"K-{code}-{employee.name}"
+
+
 def _short_visitor_label(visitor_code: str, visit_count: int = 1) -> str:
     suffix = visitor_code.rsplit("-", 1)[-1]
-    base = f"Customer #{suffix}"
+    base = f"CUST-{suffix}"
     return f"{base} (Kunjungan {visit_count})" if visit_count > 1 else base
 
 
@@ -595,6 +601,13 @@ def reclassify_visitor_to_employee(
     visitors[:] = [v for v in visitors if v.id != visitor_id]
     with SessionLocal() as session:
         row = session.get(DailyVisitor, visitor_id)
+        visitor_code = row.visitor_code if row is not None else None
+        if employee is not None and visitor_code:
+            import shutil
+            from pathlib import Path
+
+            customer_dir = Path(__file__).parent / "db_customer" / visitor_code
+            shutil.rmtree(customer_dir, ignore_errors=True)
         if row is not None:
             if employee is not None:
                 row.reclassified_employee_id = employee.id
@@ -653,7 +666,9 @@ def verify_crop_with_vision_ai(crop: np.ndarray) -> dict[str, object] | None:
         ],
     }
     try:
-        resp = requests.post(VISION_AI_BASE_URL, headers=headers, json=payload, timeout=6)
+        resp = requests.post(
+            VISION_AI_BASE_URL, headers=headers, json=payload, timeout=VISION_AI_TIMEOUT_SECONDS
+        )
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"].strip()
         if content.startswith("```"):
@@ -661,12 +676,20 @@ def verify_crop_with_vision_ai(crop: np.ndarray) -> dict[str, object] | None:
         data = json.loads(content)
         if isinstance(data, dict) and data.get("role") in {"staff", "customer"}:
             return data
+    except requests.Timeout:
+        print(f"Vision AI fallback timed out after {VISION_AI_TIMEOUT_SECONDS}s")
     except Exception as exc:
         print(f"Vision AI fallback skipped: {exc}")
     return None
 
 
-def main(stop_event=None, on_frame=None, show_window: bool = True, config: CameraConfig | None = None) -> None:
+def main(
+    stop_event=None,
+    on_frame=None,
+    on_customer_snapshot=None,
+    show_window: bool = True,
+    config: CameraConfig | None = None,
+) -> None:
     initialize_database()
     width, height, imgsz, face_size, interval = (
         PERFORMANCE_PRESETS[config.performance_level]
@@ -759,7 +782,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                 try:
                     known = load_known_faces()
                     today_visitors = load_today_visitors(current_date)
-                    names = {employee.id: f"{employee.role} - {employee.name}" for employee, _ in known}
+                    names = {employee.id: _staff_camera_label(employee) for employee, _ in known}
                     for track_id, entry in list(cache.items()):
                         if entry.get("kind") == "staff" and entry.get("employee_id") in names:
                             entry["label"] = names[entry["employee_id"]]
@@ -795,7 +818,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                                     "kind": "staff",
                                     "employee_id": candidate_emp.id,
                                     "visitor_id": None,
-                                    "label": f"{candidate_emp.role} - {candidate_emp.name}",
+                                    "label": _staff_camera_label(candidate_emp),
                                     "last_seen": now,
                                 }
                             )
@@ -806,7 +829,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                                     "kind": "staff",
                                     "employee_id": None,
                                     "visitor_id": None,
-                                    "label": "Staf Klinik (Atribut AI)",
+                                    "label": "Karyawan AI (belum teridentifikasi)",
                                     "last_seen": now,
                                 }
                             )
@@ -843,7 +866,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                         "kind": "observing",
                         "first_seen": now,
                         "last_seen": now,
-                        "label": f"Mendeteksi... #{track_id}",
+                        "label": f"Observasi... #{track_id}",
                         "employee_id": None,
                         "visitor_id": None,
                         "face_vector": None,
@@ -891,7 +914,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                                     "kind": "staff",
                                     "employee_id": employee.id,
                                     "visitor_id": None,
-                                    "label": f"{employee.role} - {employee.name}",
+                                    "label": _staff_camera_label(employee),
                                 }
                             )
                             if entry.get("body_vector") is not None:
@@ -919,7 +942,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                                 "kind": "staff",
                                 "employee_id": emp_matched.id,
                                 "visitor_id": None,
-                                "label": f"{emp_matched.role} - {emp_matched.name}",
+                                "label": _staff_camera_label(emp_matched),
                             }
                         )
                         db_write(log_identity, track_id, emp_matched, b_score, match_source="staff_body_reid")
@@ -962,14 +985,27 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                             threading.Thread(target=_bg_vision, args=(track_id, crop_copy), daemon=True).start()
 
                 # Keep existing customer's face/body signature updated if their face becomes visible later
-                elif entry.get("kind") == "customer" and entry.get("visitor_id") is not None and frame_number % 30 == 0:
+                elif entry.get("kind") == "customer" and entry.get("visitor_id") is not None:
                     vis_id = int(entry["visitor_id"])
-                    for v_item in today_visitors:
-                        if v_item.id == vis_id:
-                            if entry.get("face_vector") is not None and v_item.face_vector is None:
-                                v_item.face_vector = entry["face_vector"]  # type: ignore[assignment]
-                                db_write(update_visitor_face, vis_id, v_item.face_vector.tolist())
-                            break
+                    if frame_number % 30 == 0:
+                        for v_item in today_visitors:
+                            if v_item.id == vis_id:
+                                if entry.get("face_vector") is not None and v_item.face_vector is None:
+                                    v_item.face_vector = entry["face_vector"]  # type: ignore[assignment]
+                                    db_write(update_visitor_face, vis_id, v_item.face_vector.tolist())
+                                break
+                    # Sample a track crop every 30 inference frames; server keeps only the 10 sharpest.
+                    if on_customer_snapshot is not None and crop.size and frame_number % 30 == 0:
+                        gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                        sharpness = float(cv2.Laplacian(gray_crop, cv2.CV_64F).var())
+                        quality = min(100.0, sharpness ** 0.5)
+                        if quality >= 2.0:
+                            visitor_code = next((v.visitor_code for v in today_visitors if v.id == vis_id), None)
+                            if visitor_code:
+                                try:
+                                    on_customer_snapshot(visitor_code, crop.copy(), quality)
+                                except Exception as exc:
+                                    print(f"Customer snapshot skipped: {exc}")
 
                 kind = str(entry.get("kind", "observing"))
                 if kind == "staff":
@@ -982,12 +1018,10 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                     live_observing += 1
                     box_color = (0, 155, 245)  # Amber while observing
 
-                label = str(entry.get("label", f"#{track_id}"))
+                label = str(entry.get("label", f"Observasi... #{track_id}"))
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                 cv2.putText(frame, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
 
-            hud = f"{fps:.1f} FPS | Di Layar: {live_customers} Cust, {live_staff} Staf | Hari Ini: {len(today_visitors)} Cust"
-            cv2.putText(frame, hud, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
             if on_frame is not None:
                 if accepts_live_counts:
                     on_frame(

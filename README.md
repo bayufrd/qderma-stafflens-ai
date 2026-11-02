@@ -78,6 +78,7 @@ qderma-stafflens-ai/
 ├── .env.example            # Template konfigurasi environment (DB, Performa, Deduplikasi, & Vision AI)
 ├── yolov8n.pt              # Bobot model dasar YOLOv8 Nano (COCO)
 ├── db_karyawan/            # Folder lokal foto referensi pegawai (diabaikan oleh Git)
+├── db_customer/             # Maks. 10 snapshot crop terbaik per ID customer harian (diabaikan oleh Git)
 ├── frontend/               # Aplikasi SPA Dashboard (Vue 3 + Vite)
 │   ├── src/App.vue         # UI Ringkasan Customer/Staf, Registri Customer Harian, Pegawai, & Pengaturan
 │   └── dist/               # Hasil build produksi yang disajikan oleh server.py
@@ -85,6 +86,14 @@ qderma-stafflens-ai/
 ```
 
 ---
+
+## Snapshot Customer Lokal
+
+- Overlay live menampilkan identitas di atas kotak saja: customer `CUST-001`, karyawan `K-001-Bayu`, atau status `Observasi...`; FPS/hitungan agregat tidak ditulis menimpa frame.
+- Saat kamera berjalan, sistem mengambil crop track customer berkala dan menilai ketajaman (Laplacian); hanya crop valid/tidak terlalu blur yang disimpan.
+- Maksimal **10 snapshot dengan skor ketajaman tertinggi** per ID customer harian di `db_customer/<CUST-YYYYMMDD-NNN>/`. Snapshot tersedia melalui galeri saat row customer diklik.
+- ID customer berlaku untuk registri harian (`daily_visitors`); kunjungan hari lain tidak otomatis digabung. Crop dapat menampilkan wajah maupun pakaian/tubuh; data ini berpotensi memuat informasi pribadi.
+- Gambar hanya disajikan lewat API yang memerlukan autentikasi. Folder `db_customer/` di-ignore Git; file lokal tidak ikut backup kecuali dikonfigurasi terpisah. Hapus folder/file secara lokal untuk menghapus snapshot. Jika customer kemudian direklasifikasi sebagai staf, snapshot provisional dihapus otomatis.
 
 ## Skema Database (`database.py`)
 
@@ -152,6 +161,7 @@ Buka `http://127.0.0.1:8000`, masuk dengan `DASHBOARD_PASSWORD`, lalu klik **Mul
 | `VISION_AI_API_KEY` | *(kosong)* | Opsional: isi dengan API Key (OpenAI-compatible) untuk mengaktifkan verifikasi seragam/atribut otomatis pada kasus skor wajah nanggung (*gray zone*) atau membelakangi kamera. |
 | `VISION_AI_BASE_URL` | `https://api.openai.com/v1/chat/completions` | Endpoint Vision AI (mendukung OpenAI, Gemini OpenAI-compatible, OpenRouter, dll.). |
 | `VISION_AI_MODEL` | `gpt-4o-mini` | Nama model Vision AI yang digunakan saat fallback. |
+| `VISION_AI_TIMEOUT_SECONDS` | `120` | Timeout req Vision AI dalam detik; dijepit ke rentang 120–300 dtk (2–5 menit). |
 
 ---
 

@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import './style.css'
 import './employee-modal.css'
+import './customer-photos.css'
 
 const authenticated = ref(false)
 const checking = ref(true)
@@ -306,6 +307,7 @@ const cameraStream = ref(null)
 const cameraVideoRef = ref(null)
 const cameraCaptureOpen = ref(false)
 const employeeDeleting = ref(false)
+const customerPhotoModal = ref({ open: false, customer: null, photos: [], loading: false, error: '' })
 
 const navItems = ['Ringkasan', 'Customer', 'Pegawai', 'Pengaturan']
 
@@ -768,6 +770,22 @@ async function toggleCamera() {
   }
 }
 
+async function openCustomerPhotos(customer) {
+  customerPhotoModal.value = { open: true, customer, photos: [], loading: true, error: '' }
+  try {
+    const result = await api(`/visitors/${customer.id}/photos`)
+    customerPhotoModal.value.photos = result.photos || []
+  } catch (error) {
+    customerPhotoModal.value.error = error.message
+  } finally {
+    customerPhotoModal.value.loading = false
+  }
+}
+
+function closeCustomerPhotos() {
+  customerPhotoModal.value = { open: false, customer: null, photos: [], loading: false, error: '' }
+}
+
 const filteredVisitors = computed(() =>
   visitors.value.filter(item =>
     `${item.label} ${item.code} ${item.attributes || ''}`.toLowerCase().includes(search.value.toLowerCase()),
@@ -1038,13 +1056,6 @@ if (import.meta.hot) {
                     }}
                   </span>
                 </div>
-                <span class="camera-overlay">
-                  {{
-                    camera.running
-                      ? `LIVE · ${camera.fps} FPS · DI LAYAR: ${camera.live_customers || 0} CUST, ${camera.live_staff || 0} STAF · HARI INI: ${overview.customers_today} CUST`
-                      : 'OFFLINE'
-                  }}
-                </span>
               </div>
               <div class="camera-details">
                 <span class="scope-meta">Kontrol penghitungan</span>
@@ -1226,10 +1237,21 @@ if (import.meta.hot) {
                 <span>Pertama / Terakhir terlihat</span>
                 <span class="right">Frekuensi hari ini</span>
               </div>
-              <div v-for="vis in filteredVisitors" :key="vis.id" class="table-row">
+              <div
+                v-for="vis in filteredVisitors"
+                :key="vis.id"
+                class="table-row customer-row-clickable"
+                role="button"
+                tabindex="0"
+                :aria-label="`Lihat ${vis.label}, ${vis.photo_count || 0} foto`"
+                @click="openCustomerPhotos(vis)"
+                @keydown.enter="openCustomerPhotos(vis)"
+                @keydown.space.prevent="openCustomerPhotos(vis)"
+              >
                 <strong>
                   {{ vis.label }}
                   <small class="mono">{{ vis.code }}</small>
+                  <small>{{ vis.photo_count || 0 }} / 10 snapshot · klik untuk lihat</small>
                 </strong>
                 <span>{{ vis.attributes }}</span>
                 <span>{{ timeLabel(vis.first_seen_at) }} → {{ clockLabel(vis.last_seen_at) }}</span>
@@ -1559,6 +1581,31 @@ if (import.meta.hot) {
           <span>{{ lastUpdated ? 'Diperbarui ' + timeLabel(lastUpdated) : 'Menunggu data' }}</span>
         </footer>
       </main>
+    </div>
+
+    <div v-if="customerPhotoModal.open" class="modal-backdrop" @click.self="closeCustomerPhotos">
+      <div class="modal-dialog customer-photo-modal" role="dialog" aria-modal="true" aria-labelledby="customer-photo-title">
+        <div class="modal-header">
+          <div>
+            <span class="scope-meta modal-eyebrow">GALERI SNAPSHOT LOKAL · MAKS. 10</span>
+            <h2 id="customer-photo-title">{{ customerPhotoModal.customer?.label }} · {{ customerPhotoModal.customer?.code }}</h2>
+            <p>Snapshot crop customer terpilih berdasarkan ketajaman gambar. Tersimpan lokal di db_customer/.</p>
+          </div>
+          <button type="button" class="button secondary" @click="closeCustomerPhotos">Tutup</button>
+        </div>
+        <div class="customer-photo-grid">
+          <p v-if="customerPhotoModal.loading" class="empty-state">Memuat snapshot…</p>
+          <p v-else-if="customerPhotoModal.error" class="form-error">{{ customerPhotoModal.error }}</p>
+          <p v-else-if="!customerPhotoModal.photos.length" class="empty-state">Belum ada snapshot tersimpan. Snapshot diambil saat kamera berjalan.</p>
+          <img
+            v-for="photo in customerPhotoModal.photos"
+            :key="photo.name"
+            :src="photo.url"
+            :alt="`Snapshot ${customerPhotoModal.customer?.label}`"
+            loading="lazy"
+          />
+        </div>
+      </div>
     </div>
 
     <!-- Modal Tambah / Edit Pegawai & Galeri Foto db_karyawan -->

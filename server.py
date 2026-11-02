@@ -49,11 +49,15 @@ SESSION_TTL = 8 * 60 * 60
 ROOT_DIR = Path(__file__).parent
 DIST = ROOT_DIR / "frontend" / "dist"
 DB_KARYAWAN_DIR = ROOT_DIR / "db_karyawan"
+DB_CUSTOMER_DIR = ROOT_DIR / "db_customer"
+CUSTOMER_SNAPSHOT_LIMIT = 10
+_CUSTOMER_SNAPSHOT_LOCK = threading.Lock()
 ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 # C5: dashboard preview throttle/resize (baseline: 8 fps, full-size frame, JPEG 65). See docs/OPTIMASI_PERFORMA.md.
 PREVIEW_MAX_FPS = max(1.0, float(os.getenv("PREVIEW_MAX_FPS", "15")))
 PREVIEW_MAX_WIDTH = max(0, int(os.getenv("PREVIEW_MAX_WIDTH", "640")))
 PREVIEW_JPEG_QUALITY = min(100, max(10, int(os.getenv("PREVIEW_JPEG_QUALITY", "65"))))
+VISION_AI_TIMEOUT_SECONDS = min(300, max(120, int(os.getenv("VISION_AI_TIMEOUT_SECONDS", "120"))))
 
 
 def _face_model_name() -> str:
@@ -401,7 +405,7 @@ def _probe_vision_ai() -> None:
                     "max_tokens": 2,
                     "temperature": 0,
                 },
-                timeout=(3, 6),
+                timeout=(3, VISION_AI_TIMEOUT_SECONDS),
             )
             response.raise_for_status()
             payload = response.json()
@@ -562,7 +566,13 @@ def _worker_main(config: CameraSettingsBody, stop_event: threading.Event) -> Non
                     _notify_ws_waiters(frame_only=not status_changed)
 
         if not stop_event.is_set():
-            main(stop_event=stop_event, on_frame=on_frame, show_window=False, config=CameraConfig(**config.model_dump()))
+            main(
+                stop_event=stop_event,
+                on_frame=on_frame,
+                on_customer_snapshot=_save_customer_snapshot,
+                show_window=False,
+                config=CameraConfig(**config.model_dump()),
+            )
     except Exception as exc:
         with _state_lock:
             _error = str(exc)
@@ -723,6 +733,7 @@ def _query_visitors(db: Session, limit: int = 50) -> dict:
                 "has_face": row.face_vector is not None,
                 "attributes": row.attributes_summary or ("Wajah + Pakaian" if row.face_vector else "Pola Pakaian"),
                 "confidence": row.confidence,
+                "photo_count": _customer_photo_count(row.visitor_code),
             }
         )
     return {"items": items, "date": today_date.isoformat()}
@@ -817,6 +828,71 @@ def overview() -> dict:
     _ensure_db()
     with SessionLocal() as db:
         return _query_overview(db)
+
+
+def _customer_folder(visitor_code: str) -> Path:
+    if not re.fullmatch(r"CUST-\d{8}-\d+", visitor_code):
+        raise HTTPException(status_code=400, detail="ID customer tidak valid")
+    return DB_CUSTOMER_DIR / visitor_code
+
+
+def _customer_photo_count(visitor_code: str) -> int:
+    folder = _customer_folder(visitor_code)
+    if not folder.is_dir():
+        return 0
+    return sum(1 for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".jpg")
+
+
+def _save_customer_snapshot(visitor_code: str, crop: np.ndarray, quality: float) -> None:
+    """Keep the ten sharpest valid track crops for this daily visitor, local-only."""
+    if crop is None or crop.size == 0 or crop.shape[0] < 80 or crop.shape[1] < 60:
+        return
+    folder = _customer_folder(visitor_code)
+    with _CUSTOMER_SNAPSHOT_LOCK:
+        folder.mkdir(parents=True, exist_ok=True)
+        photos = sorted(folder.glob("*.jpg"))
+        if len(photos) >= CUSTOMER_SNAPSHOT_LIMIT:
+            try:
+                lowest = min(photos, key=lambda p: float(p.stem.split("_", 1)[0]))
+            except (ValueError, IndexError):
+                lowest = photos[0]
+            if quality <= float(lowest.stem.split("_", 1)[0]):
+                return
+            lowest.unlink(missing_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        output = folder / f"{quality:.2f}_{stamp}.jpg"
+        ok, encoded = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        if ok:
+            output.write_bytes(encoded.tobytes())
+
+
+@app.get("/api/visitors/{visitor_id}/photos", dependencies=[Depends(require_auth)])
+def visitor_photos(visitor_id: int) -> dict:
+    _ensure_db()
+    with SessionLocal() as db:
+        visitor = db.get(DailyVisitor, visitor_id)
+        if visitor is None or visitor.reclassified_employee_id is not None:
+            raise HTTPException(status_code=404, detail="Customer tidak ditemukan")
+        photos = sorted(_customer_folder(visitor.visitor_code).glob("*.jpg"), reverse=True)
+        return {"code": visitor.visitor_code, "photos": [
+            {"name": p.name, "url": f"/api/visitors/{visitor.id}/photos/{p.name}"} for p in photos
+        ]}
+
+
+@app.get("/api/visitors/{visitor_id}/photos/{filename}", dependencies=[Depends(require_auth)])
+def visitor_photo(visitor_id: int, filename: str) -> Response:
+    if Path(filename).name != filename or not filename.endswith(".jpg"):
+        raise HTTPException(status_code=400, detail="Nama foto tidak valid")
+    _ensure_db()
+    with SessionLocal() as db:
+        visitor = db.get(DailyVisitor, visitor_id)
+        if visitor is None or visitor.reclassified_employee_id is not None:
+            raise HTTPException(status_code=404, detail="Customer tidak ditemukan")
+        folder = _customer_folder(visitor.visitor_code).resolve()
+    file_path = (folder / filename).resolve()
+    if file_path.parent != folder or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Foto customer tidak ditemukan")
+    return FileResponse(file_path, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/visitors", dependencies=[Depends(require_auth)])

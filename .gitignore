@@ -6,6 +6,7 @@ __pycache__/
 
 # Biometric references and generated media
 db_karyawan/
+db_customer/
 data/
 events/
 
