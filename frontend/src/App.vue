@@ -302,6 +302,9 @@ const modalEmployee = ref({
 })
 const photosToDelete = ref([])
 const pendingUploads = ref([])
+const cameraStream = ref(null)
+const cameraVideoRef = ref(null)
+const cameraCaptureOpen = ref(false)
 const employeeDeleting = ref(false)
 
 const navItems = ['Ringkasan', 'Customer', 'Pegawai', 'Pengaturan']
@@ -560,6 +563,7 @@ async function openEmployeeModal(emp = null) {
 
 function closeEmployeeModal() {
   if (modalSaving.value) return
+  stopPhotoCamera()
   showEmployeeModal.value = false
   modalError.value = ''
   modalNotice.value = ''
@@ -575,6 +579,46 @@ function toggleDeleteExistingPhoto(photoName) {
 
 function removePendingUpload(index) {
   pendingUploads.value.splice(index, 1)
+}
+
+async function startPhotoCamera() {
+  modalError.value = ''
+  if (!navigator.mediaDevices?.getUserMedia) {
+    modalError.value = 'Kamera browser tidak tersedia. Gunakan HTTPS atau localhost, atau pilih foto dari perangkat.'
+    return
+  }
+  try {
+    cameraStream.value = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false })
+    cameraCaptureOpen.value = true
+    await nextTick()
+    cameraVideoRef.value.srcObject = cameraStream.value
+    await cameraVideoRef.value.play()
+  } catch (error) {
+    stopPhotoCamera()
+    modalError.value = `Tidak dapat membuka kamera: ${error.message || 'izin kamera ditolak'}`
+  }
+}
+
+function stopPhotoCamera() {
+  cameraStream.value?.getTracks().forEach(track => track.stop())
+  cameraStream.value = null
+  cameraCaptureOpen.value = false
+}
+
+function capturePhoto() {
+  const video = cameraVideoRef.value
+  if (!video || !video.videoWidth) return
+  const canvas = document.createElement('canvas')
+  canvas.width = video.videoWidth
+  canvas.height = video.videoHeight
+  canvas.getContext('2d').drawImage(video, 0, 0)
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.92)
+  pendingUploads.value.push({
+    filename: `capture-${new Date().toISOString().replace(/[:.]/g, '-')}.jpg`,
+    size_bytes: Math.round((dataUrl.length * 3) / 4),
+    data_url: dataUrl,
+  })
+  modalError.value = ''
 }
 
 function onSelectPhotoFiles(event) {
@@ -1631,6 +1675,14 @@ if (import.meta.hot) {
             <span>Pegawai aktif (dikenali kamera &amp; dikecualikan dari hitungan customer)</span>
           </label>
 
+          <div v-if="cameraCaptureOpen" class="camera-capture-panel">
+            <video ref="cameraVideoRef" autoplay playsinline muted></video>
+            <div class="camera-capture-actions">
+              <button type="button" class="button primary" @click="capturePhoto">Jepret foto</button>
+              <button type="button" class="button secondary" @click="stopPhotoCamera">Tutup kamera</button>
+            </div>
+            <small>Pastikan izin kamera diberikan. Browser perlu HTTPS atau localhost.</small>
+          </div>
           <div class="photo-section employee-section">
             <div class="photo-section-head">
               <div>
@@ -1639,8 +1691,10 @@ if (import.meta.hot) {
                   {{ modalEmployee.id ? 'Tambahkan foto baru atau tandai foto lama yang ingin dihapus.' : 'Minimal 1 foto wajib. Gunakan wajah terang, satu orang per foto; disarankan 3–5 foto.' }}
                 </p>
               </div>
-              <label class="button secondary upload-trigger">
-                + Pilih foto (.jpg/.png)
+              <div class="photo-source-actions">
+                <button type="button" class="button secondary" @click="startPhotoCamera">📷 Ambil foto</button>
+                <label class="button secondary upload-trigger">
+                  + Pilih foto (.jpg/.png)
                 <input
                   type="file"
                   accept=".jpg,.jpeg,.png,image/jpeg,image/png"
@@ -1648,7 +1702,8 @@ if (import.meta.hot) {
                   hidden
                   @change="onSelectPhotoFiles"
                 />
-              </label>
+                </label>
+              </div>
             </div>
 
             <div v-if="modalLoading" class="empty-state">Memuat foto dari folder db_karyawan…</div>
