@@ -1669,14 +1669,18 @@ if (import.meta.hot) {
     </div>
 
     <div v-if="customerReview.open" class="modal-backdrop" @click.self="customerReview.open = false">
-      <div class="modal-dialog" role="dialog" aria-modal="true">
-        <div class="modal-header"><div><span class="scope-meta modal-eyebrow">VALIDASI CUSTOMER</span><h2>Tandai salah / Hapus</h2><p>Pilih alasan. Feedback tersimpan di PostgreSQL.</p></div><button class="button secondary" @click="customerReview.open = false">Tutup</button></div>
-        <div class="review-reasons">
-          <button v-for="item in reviewReasons" :key="item[0]" type="button" class="button" :class="customerReview.reason === item[0] ? 'primary' : 'secondary'" @click="customerReview.reason = item[0]">{{ item[1] }}</button>
+      <div class="modal-dialog customer-review-modal" role="dialog" aria-modal="true" aria-labelledby="review-title">
+        <div class="modal-header">
+          <div><span class="scope-meta modal-eyebrow">VALIDASI CUSTOMER</span><h2 id="review-title">Tandai deteksi salah</h2><p>Pilih alasan agar sistem menyimpan feedback yang tepat.</p></div>
+          <button type="button" class="button secondary" @click="customerReview.open = false">Tutup</button>
         </div>
-        <textarea v-if="customerReview.reason === 'other'" v-model="customerReview.note" rows="3" placeholder="Catatan opsional"></textarea>
+        <div class="customer-review-intro"><span aria-hidden="true">⚠</span><div><strong>{{ customerReview.customer?.label }} · {{ customerReview.customer?.code }}</strong><span>Customer akan disembunyikan dari hitungan aktif. Data tetap dapat dipulihkan.</span></div></div>
+        <div class="review-reasons" role="group" aria-label="Alasan validasi">
+          <button v-for="item in reviewReasons" :key="item[0]" type="button" class="button" :class="customerReview.reason === item[0] ? 'primary' : 'secondary'" :aria-pressed="customerReview.reason === item[0]" @click="customerReview.reason = item[0]">{{ item[1] }}</button>
+        </div>
+        <textarea v-if="customerReview.reason === 'other'" v-model="customerReview.note" class="review-note" rows="3" placeholder="Catatan opsional"></textarea>
         <p v-if="customerReview.error" class="form-error">{{ customerReview.error }}</p>
-        <button type="button" class="button danger-button" :disabled="!customerReview.reason || customerReview.busy" @click="submitCustomerReview">{{ customerReview.busy ? 'Menyimpan…' : 'Konfirmasi hapus' }}</button>
+        <div class="review-footer"><button type="button" class="button secondary" @click="customerReview.open = false">Batal</button><button type="button" class="button danger-button" :disabled="!customerReview.reason || customerReview.busy" @click="submitCustomerReview">{{ customerReview.busy ? 'Menyimpan…' : 'Tandai salah & sembunyikan' }}</button></div>
       </div>
     </div>
 
