@@ -1649,7 +1649,9 @@ if (import.meta.hot) {
             <p>Snapshot crop customer terpilih berdasarkan ketajaman gambar. Tersimpan lokal di db_customer/.</p>
           </div>
           <div class="modal-actions">
-            <button type="button" class="button danger-button" @click="openCustomerReview(customerPhotoModal.customer)">Tandai salah / Hapus</button>
+            <button type="button" class="button danger-button icon-action" title="Tandai salah / Hapus" aria-label="Tandai salah / Hapus" @click="openCustomerReview(customerPhotoModal.customer)">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.8 20h18.4L12 3Zm0 5.2 5.2 9.3H6L12 8.2ZM11 11v4h2v-4h-2Zm0 5v2h2v-2h-2Z"/></svg>
+            </button>
             <button type="button" class="button secondary" @click="closeCustomerPhotos">Tutup</button>
           </div>
         </div>
@@ -1674,7 +1676,7 @@ if (import.meta.hot) {
           <div><span class="scope-meta modal-eyebrow">VALIDASI CUSTOMER</span><h2 id="review-title">Tandai deteksi salah</h2><p>Pilih alasan agar sistem menyimpan feedback yang tepat.</p></div>
           <button type="button" class="button secondary" @click="customerReview.open = false">Tutup</button>
         </div>
-        <div class="customer-review-intro"><span aria-hidden="true">⚠</span><div><strong>{{ customerReview.customer?.label }} · {{ customerReview.customer?.code }}</strong><span>Customer akan disembunyikan dari hitungan aktif. Data tetap dapat dipulihkan.</span></div></div>
+        <div class="customer-review-intro"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.8 20h18.4L12 3Zm0 5.2 5.2 9.3H6L12 8.2ZM11 11v4h2v-4h-2Zm0 5v2h2v-2h-2Z"/></svg><div><strong>{{ customerReview.customer?.label }} · {{ customerReview.customer?.code }}</strong><span>Customer akan disembunyikan dari hitungan aktif. Data tetap dapat dipulihkan.</span></div></div>
         <div class="review-reasons" role="group" aria-label="Alasan validasi">
           <button v-for="item in reviewReasons" :key="item[0]" type="button" class="button" :class="customerReview.reason === item[0] ? 'primary' : 'secondary'" :aria-pressed="customerReview.reason === item[0]" @click="customerReview.reason = item[0]">{{ item[1] }}</button>
         </div>
