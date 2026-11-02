@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import cv2
@@ -27,7 +28,10 @@ def main() -> None:
     if not photos:
         raise SystemExit("No .jpg/.jpeg/.png photos found.")
 
-    face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+    face_model = os.getenv("FACE_MODEL", "buffalo_l").strip() or "buffalo_l"
+    face_app = FaceAnalysis(
+        name=face_model, providers=["CPUExecutionProvider"], allowed_modules=["detection", "recognition"]
+    )
     face_app.prepare(ctx_id=0, det_size=(640, 640))
     vectors: list[list[float]] = []
 
@@ -52,10 +56,10 @@ def main() -> None:
             session.flush()
         else:
             employee.name, employee.role, employee.active = args.name, args.role, True
-            session.query(FaceEmbedding).filter_by(employee_id=employee.id).delete()
+            session.query(FaceEmbedding).filter_by(employee_id=employee.id, model_name=face_model).delete()
 
         for vector in vectors:
-            session.add(FaceEmbedding(employee_id=employee.id, vector=vector, model_name="buffalo_l"))
+            session.add(FaceEmbedding(employee_id=employee.id, vector=vector, model_name=face_model))
         session.commit()
 
     print(f"Saved {len(vectors)} face embedding(s) for {args.name}.")

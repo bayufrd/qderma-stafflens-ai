@@ -6,6 +6,7 @@ import base64
 import inspect
 import json
 import os
+import queue
 import threading
 import time
 import warnings
@@ -68,9 +69,141 @@ CAMERA_HEIGHT = int(os.getenv("CAMERA_HEIGHT") or _preset_height)
 YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ") or _preset_imgsz)
 FACE_DET_SIZE = int(os.getenv("FACE_DET_SIZE") or _preset_face_size)
 FACE_INTERVAL = int(os.getenv("FACE_DETECTION_INTERVAL") or _preset_interval)
-PROVIDERS = [item.strip() for item in os.getenv("ONNX_PROVIDERS", "CPUExecutionProvider").split(",") if item.strip()]
+def _resolve_onnx_providers(raw: str) -> list[str]:
+    """A2: 'auto' = CoreML (if available) + CPU. Unavailable providers are dropped; CPU is always the fallback."""
+    try:
+        import onnxruntime as ort
+
+        available = set(ort.get_available_providers())
+    except Exception:
+        available = {"CPUExecutionProvider"}
+    value = raw.strip()
+    if value.lower() == "auto":
+        wanted = ["CUDAExecutionProvider", "CoreMLExecutionProvider", "CPUExecutionProvider"]
+    else:
+        wanted = [item.strip() for item in value.split(",") if item.strip()]
+    providers = [item for item in wanted if item in available]
+    if "CPUExecutionProvider" not in providers:
+        providers.append("CPUExecutionProvider")
+    return providers
+
+
+def _resolve_yolo_device(raw: str) -> str | None:
+    """A1: '' = Ultralytics default (CUDA if present else CPU); 'auto' = cuda -> mps -> cpu; or an explicit device."""
+    value = raw.strip().lower()
+    if not value:
+        return None
+    if value != "auto":
+        return value
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _face_allowed_modules(raw: str) -> list[str] | None:
+    """B3: only load the InsightFace modules the pipeline uses. 'all' or empty = load every module (baseline)."""
+    value = raw.strip().lower()
+    if not value or value == "all":
+        return None
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _env_flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+PROVIDERS = _resolve_onnx_providers(os.getenv("ONNX_PROVIDERS", "CPUExecutionProvider"))
+YOLO_DEVICE = _resolve_yolo_device(os.getenv("YOLO_DEVICE", ""))
+FACE_ALLOWED_MODULES = _face_allowed_modules(os.getenv("FACE_ALLOWED_MODULES", "detection,recognition"))
+CAMERA_THREADED = _env_flag("CAMERA_THREADED", "1")
+DB_ASYNC_WRITES = _env_flag("DB_ASYNC_WRITES", "1")
 
 _vision_semaphore = threading.Semaphore(1)
+
+
+def load_yolo_model() -> tuple[YOLO, str]:
+    """D8: load YOLO_MODEL; if an exported .onnx file is missing, fall back to the matching .pt weights."""
+    path = YOLO_MODEL
+    if path.lower().endswith(".onnx") and not os.path.exists(path):
+        fallback = path[: -len(".onnx")] + ".pt"
+        print(f"YOLO model {path} not found; falling back to {fallback}. See docs/OPTIMASI_PERFORMA.md section 4.")
+        path = fallback
+    if path.lower().endswith(".onnx"):
+        return YOLO(path, task="detect"), path
+    return YOLO(path), path
+
+
+class LatestFrameReader:
+    """C4: read the camera on a background thread and always hand out the newest frame (stale frames are dropped)."""
+
+    def __init__(self, cap: cv2.VideoCapture) -> None:
+        self._cap = cap
+        self._cond = threading.Condition()
+        self._frame: np.ndarray | None = None
+        self._seq = 0
+        self._ok = True
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, name="camera-reader", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stopped:
+            ok, frame = self._cap.read()
+            with self._cond:
+                if not ok:
+                    self._ok = False
+                    self._cond.notify_all()
+                    return
+                self._frame = frame
+                self._seq += 1
+                self._cond.notify_all()
+
+    def read(self, last_seq: int, timeout: float = 10.0) -> tuple[bool, np.ndarray | None, int]:
+        with self._cond:
+            self._cond.wait_for(lambda: self._seq != last_seq or not self._ok or self._stopped, timeout=timeout)
+            if self._seq != last_seq and self._frame is not None:
+                return True, self._frame, self._seq
+            return False, None, self._seq
+
+    def stop(self) -> None:
+        with self._cond:
+            self._stopped = True
+            self._cond.notify_all()
+        self._thread.join(timeout=2.0)
+
+
+class BackgroundDbWriter:
+    """C6: run non-critical DB writes on one FIFO worker thread so inference does not wait for PostgreSQL."""
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="db-writer", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            fn, args, kwargs = item
+            try:
+                fn(*args, **kwargs)
+            except Exception as exc:
+                print(f"Background DB write failed: {exc}")
+
+    def submit(self, fn, *args, **kwargs) -> None:
+        self._queue.put((fn, args, kwargs))
+
+    def close(self, timeout: float = 5.0) -> None:
+        self._queue.put(None)
+        self._thread.join(timeout=timeout)
 
 
 @dataclass(frozen=True)
@@ -165,7 +298,7 @@ def load_known_faces() -> list[tuple[Employee, np.ndarray]]:
         rows = (
             session.query(Employee, FaceEmbedding)
             .join(FaceEmbedding, FaceEmbedding.employee_id == Employee.id)
-            .filter(Employee.active.is_(True))
+            .filter(Employee.active.is_(True), FaceEmbedding.model_name == FACE_MODEL)
             .all()
         )
         return [(employee, normalized(np.asarray(embedding.vector, dtype=np.float32))) for employee, embedding in rows]
@@ -431,6 +564,23 @@ def register_or_update_visitor(
         return entry, True
 
 
+def update_visitor_attributes(visitor_id: int, attributes_summary: str) -> None:
+    with SessionLocal() as session:
+        row = session.get(DailyVisitor, visitor_id)
+        if row is not None:
+            row.attributes_summary = attributes_summary
+            session.commit()
+
+
+def update_visitor_face(visitor_id: int, face_vector: list[float]) -> None:
+    with SessionLocal() as session:
+        row = session.get(DailyVisitor, visitor_id)
+        if row is not None:
+            row.face_vector = face_vector
+            row.attributes_summary = "Wajah + Pakaian"
+            session.commit()
+
+
 def reclassify_visitor_to_employee(
     visitor_id: int | None,
     employee: Employee | None,
@@ -536,10 +686,19 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
         "Press q to quit."
     )
 
-    model = YOLO(YOLO_MODEL)
+    model, yolo_path = load_yolo_model()
+    yolo_device = YOLO_DEVICE
+    if yolo_device == "mps" and yolo_path.lower().endswith(".onnx"):
+        yolo_device = "cpu"
+    yolo_kwargs: dict[str, object] = {"device": yolo_device} if yolo_device else {}
     tracker = sv.ByteTrack()
-    face_app = FaceAnalysis(name=FACE_MODEL, providers=PROVIDERS)
+    face_app = FaceAnalysis(name=FACE_MODEL, providers=PROVIDERS, allowed_modules=FACE_ALLOWED_MODULES)
     face_app.prepare(ctx_id=0, det_size=(face_size, face_size))
+    print(
+        f"Runtime: YOLO={yolo_path} device={yolo_device or 'default'} | FACE_MODEL={FACE_MODEL} "
+        f"modules={sorted(face_app.models)} providers={PROVIDERS} | threaded_capture={CAMERA_THREADED} "
+        f"async_db={DB_ASYNC_WRITES}"
+    )
 
     if stop_event is not None and stop_event.is_set():
         return
@@ -549,6 +708,15 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    reader = LatestFrameReader(cap) if CAMERA_THREADED else None
+    reader_seq = 0
+    db_writer = BackgroundDbWriter() if DB_ASYNC_WRITES else None
+
+    def db_write(fn, *args, **kwargs) -> None:
+        if db_writer is not None:
+            db_writer.submit(fn, *args, **kwargs)
+        else:
+            fn(*args, **kwargs)
 
     # track_id -> state dict
     cache: dict[int, dict[str, object]] = {}
@@ -569,8 +737,11 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
     last_frame = last_refresh
     try:
         while stop_event is None or not stop_event.is_set():
-            ok, frame = cap.read()
-            if not ok:
+            if reader is not None:
+                ok, frame, reader_seq = reader.read(reader_seq)
+            else:
+                ok, frame = cap.read()
+            if not ok or frame is None:
                 break
             frame_number += 1
             now = time.monotonic()
@@ -628,7 +799,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                                     "last_seen": now,
                                 }
                             )
-                            log_identity(v_track_id, candidate_emp, v_conf, match_source="vision_ai+face")
+                            db_write(log_identity, v_track_id, candidate_emp, v_conf, match_source="vision_ai+face")
                         else:
                             t_entry.update(
                                 {
@@ -641,11 +812,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                             )
                     elif v_role == "customer" and v_attr and t_entry.get("visitor_id") is not None:
                         vis_id = int(t_entry["visitor_id"])
-                        with SessionLocal() as session:
-                            vis_row = session.get(DailyVisitor, vis_id)
-                            if vis_row is not None:
-                                vis_row.attributes_summary = v_attr[:255]
-                                session.commit()
+                        db_write(update_visitor_attributes, vis_id, v_attr[:255])
                         for v_item in today_visitors:
                             if v_item.id == vis_id:
                                 v_item.attributes_summary = v_attr[:255]
@@ -655,7 +822,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                 if now - float(stale_entry.get("last_seen", now)) > CACHE_TTL:
                     cache.pop(stale_id, None)
 
-            result = model(frame, classes=[0], conf=YOLO_CONFIDENCE, imgsz=imgsz, verbose=False)[0]
+            result = model(frame, classes=[0], conf=YOLO_CONFIDENCE, imgsz=imgsz, verbose=False, **yolo_kwargs)[0]
             detections = tracker.update_with_detections(sv.Detections.from_ultralytics(result))
             face_checked = False
 
@@ -729,7 +896,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                             )
                             if entry.get("body_vector") is not None:
                                 staff_body_cache[employee.id] = (employee, entry["body_vector"], now)  # type: ignore[arg-type]
-                            log_identity(track_id, employee, score, match_source="face")
+                            db_write(log_identity, track_id, employee, score, match_source="face")
                         elif best_emp and best_emp[1] >= GRAY_ZONE_THRESHOLD:
                             entry["gray_employee"] = best_emp[0]
                             entry["gray_score"] = best_emp[1]
@@ -755,7 +922,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                                 "label": f"{emp_matched.role} - {emp_matched.name}",
                             }
                         )
-                        log_identity(track_id, emp_matched, b_score, match_source="staff_body_reid")
+                        db_write(log_identity, track_id, emp_matched, b_score, match_source="staff_body_reid")
                     else:
                         visitor_entry, _ = register_or_update_visitor(
                             track_id=track_id,
@@ -801,12 +968,7 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                         if v_item.id == vis_id:
                             if entry.get("face_vector") is not None and v_item.face_vector is None:
                                 v_item.face_vector = entry["face_vector"]  # type: ignore[assignment]
-                                with SessionLocal() as session:
-                                    db_v = session.get(DailyVisitor, vis_id)
-                                    if db_v is not None:
-                                        db_v.face_vector = v_item.face_vector.tolist()
-                                        db_v.attributes_summary = "Wajah + Pakaian"
-                                        session.commit()
+                                db_write(update_visitor_face, vis_id, v_item.face_vector.tolist())
                             break
 
                 kind = str(entry.get("kind", "observing"))
@@ -840,7 +1002,11 @@ def main(stop_event=None, on_frame=None, show_window: bool = True, config: Camer
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
     finally:
+        if reader is not None:
+            reader.stop()
         cap.release()
+        if db_writer is not None:
+            db_writer.close()
         if show_window:
             cv2.destroyAllWindows()
 

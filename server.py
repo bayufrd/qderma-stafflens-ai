@@ -50,6 +50,21 @@ ROOT_DIR = Path(__file__).parent
 DIST = ROOT_DIR / "frontend" / "dist"
 DB_KARYAWAN_DIR = ROOT_DIR / "db_karyawan"
 ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+# C5: dashboard preview throttle/resize (baseline: 8 fps, full-size frame, JPEG 65). See docs/OPTIMASI_PERFORMA.md.
+PREVIEW_MAX_FPS = max(1.0, float(os.getenv("PREVIEW_MAX_FPS", "15")))
+PREVIEW_MAX_WIDTH = max(0, int(os.getenv("PREVIEW_MAX_WIDTH", "640")))
+PREVIEW_JPEG_QUALITY = min(100, max(10, int(os.getenv("PREVIEW_JPEG_QUALITY", "65"))))
+
+
+def _face_model_name() -> str:
+    return os.getenv("FACE_MODEL", "buffalo_l").strip() or "buffalo_l"
+
+
+def _face_allowed_modules() -> list[str] | None:
+    value = os.getenv("FACE_ALLOWED_MODULES", "detection,recognition").strip().lower()
+    if not value or value == "all":
+        return None
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 app = FastAPI(title="StaffLens AI", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -220,7 +235,9 @@ def _get_face_analyzer():
     if _face_analyzer is None:
         from insightface.app import FaceAnalysis
 
-        analyzer = FaceAnalysis(name=os.getenv("FACE_MODEL", "buffalo_l"), providers=["CPUExecutionProvider"])
+        analyzer = FaceAnalysis(
+            name=_face_model_name(), providers=["CPUExecutionProvider"], allowed_modules=_face_allowed_modules()
+        )
         analyzer.prepare(ctx_id=0, det_size=(640, 640))
         _face_analyzer = analyzer
     return _face_analyzer
@@ -476,12 +493,17 @@ def _worker_main(config: CameraSettingsBody, stop_event: threading.Event) -> Non
 
         def on_frame(image, fps: float, live_counts: dict[str, int] | None = None) -> None:
             global _frame, _fps, _frame_version, _live_counts
-            # At most 8 preview JPEGs/s; inference and encoding happen once per camera.
+            # At most PREVIEW_MAX_FPS preview JPEGs/s; inference and encoding happen once per camera.
             now_mono = time.monotonic()
-            if now_mono - getattr(on_frame, "last", 0.0) < 0.125:
+            if now_mono - getattr(on_frame, "last", 0.0) < 1.0 / PREVIEW_MAX_FPS:
                 return
             on_frame.last = now_mono
-            ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 65])
+            if PREVIEW_MAX_WIDTH and image.shape[1] > PREVIEW_MAX_WIDTH:
+                scale = PREVIEW_MAX_WIDTH / image.shape[1]
+                image = cv2.resize(
+                    image, (PREVIEW_MAX_WIDTH, max(1, int(image.shape[0] * scale))), interpolation=cv2.INTER_AREA
+                )
+            ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY])
             if ok:
                 with _frame_ready:
                     had_frame = _frame is not None
@@ -955,7 +977,7 @@ def _save_employee_and_photos(employee_id: int | None, body: EmployeeSaveBody) -
         if photos_changed:
             db.query(FaceEmbedding).filter_by(employee_id=employee.id).delete()
             for vec in vectors:
-                db.add(FaceEmbedding(employee_id=employee.id, vector=vec, model_name="buffalo_l"))
+                db.add(FaceEmbedding(employee_id=employee.id, vector=vec, model_name=_face_model_name()))
 
         db.commit()
         total_emb = db.scalar(select(func.count(FaceEmbedding.id)).where(FaceEmbedding.employee_id == employee.id)) or 0
