@@ -10,8 +10,10 @@ import queue
 import threading
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 warnings.filterwarnings("ignore", category=FutureWarning, module=r"insightface\..*")
 
@@ -41,17 +43,49 @@ CUSTOMER_MIN_DWELL_SECONDS = float(os.getenv("CUSTOMER_MIN_DWELL_SECONDS", "3.5"
 REENTRY_GAP_SECONDS = float(os.getenv("VISITOR_REENTRY_GAP_SECONDS", "30"))
 CACHE_TTL = int(os.getenv("IDENTITY_CACHE_TTL_SECONDS", "60"))
 EMPLOYEE_REFRESH_SECONDS = max(1, int(os.getenv("EMPLOYEE_REFRESH_SECONDS", "15")))
+CUSTOMER_SNAPSHOT_DIR = Path(os.getenv("CUSTOMER_SNAPSHOT_DIR", "customer_snapshots/temp"))
+
+
+def save_customer_snapshot(crop: np.ndarray, track_id: int) -> str | None:
+    """Persist first detected crop before face/customer analysis; never block inference on failure."""
+    if crop is None or crop.size == 0:
+        return None
+    try:
+        CUSTOMER_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = CUSTOMER_SNAPSHOT_DIR / f"track_{track_id}_{stamp}.jpg"
+        ok, encoded = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if ok:
+            path.write_bytes(encoded.tobytes())
+            return str(path)
+    except Exception as exc:
+        print(f"Customer snapshot gagal disimpan: {exc}")
+    return None
 
 # Optional Smart Fallback Vision AI (OpenAI-compatible /chat/completions endpoint)
 VISION_AI_BASE_URL = os.getenv("VISION_AI_BASE_URL", "https://api.openai.com/v1/chat/completions").strip()
 VISION_AI_API_KEY = os.getenv("VISION_AI_API_KEY", "").strip()
 VISION_AI_MODEL = os.getenv("VISION_AI_MODEL", "gpt-4o-mini").strip()
-VISION_AI_TIMEOUT_SECONDS = min(300, max(120, int(os.getenv("VISION_AI_TIMEOUT_SECONDS", "120"))))
+VISION_AI_TIMEOUT_SECONDS = min(30, max(5, int(os.getenv("VISION_AI_TIMEOUT_SECONDS", "30"))))
+SNAPSHOT_RETENTION_SECONDS = max(3600, int(os.getenv("SNAPSHOT_RETENTION_SECONDS", "86400")))
 VISION_AI_STAFF_HINT = os.getenv(
     "VISION_AI_STAFF_HINT",
     "Staf klinik QDerma memakai seragam kerja klinik (scrub/tunik medis), jas dokter putih, atau lanyard ID card. "
     "Pengunjung/customer memakai pakaian kasual/bebas.",
 ).strip()
+
+def cleanup_temp_snapshots() -> None:
+    """Best-effort retention cleanup; never blocks/fails the camera loop."""
+    try:
+        if not CUSTOMER_SNAPSHOT_DIR.exists():
+            return
+        cutoff = time.time() - SNAPSHOT_RETENTION_SECONDS
+        for path in CUSTOMER_SNAPSHOT_DIR.glob("*.jpg"):
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+    except Exception as exc:
+        print(f"Snapshot cleanup skipped: {exc}")
+
 
 # Level 1 = current quality; higher levels use less CPU but detect smaller faces less reliably.
 PERFORMANCE_PRESETS = {
@@ -734,6 +768,8 @@ def main(
     reader = LatestFrameReader(cap) if CAMERA_THREADED else None
     reader_seq = 0
     db_writer = BackgroundDbWriter() if DB_ASYNC_WRITES else None
+    snapshot_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snapshot-writer")
+    cleanup_temp_snapshots()
 
     def db_write(fn, *args, **kwargs) -> None:
         if db_writer is not None:
@@ -862,8 +898,12 @@ def main(
 
                 entry = cache.get(track_id)
                 if entry is None:
+                    snapshot_job = None
+                    if crop.size:
+                        snapshot_job = snapshot_writer.submit(save_customer_snapshot, crop.copy(), track_id)
                     entry = {
                         "kind": "observing",
+                        "snapshot_job": snapshot_job,
                         "first_seen": now,
                         "last_seen": now,
                         "label": f"Observasi... #{track_id}",
@@ -1041,6 +1081,7 @@ def main(
         cap.release()
         if db_writer is not None:
             db_writer.close()
+        snapshot_writer.shutdown(wait=False, cancel_futures=True)
         if show_window:
             cv2.destroyAllWindows()
 
