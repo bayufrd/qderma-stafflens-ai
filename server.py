@@ -112,6 +112,7 @@ _attach_log_filter()
 @app.on_event("startup")
 def _install_log_filter() -> None:
     _attach_log_filter()
+    _check_models_on_startup()
     _start_vision_ai_check()
 
 
@@ -220,6 +221,38 @@ def _resolve_employee_folder(employee_code: str, employee_name: str) -> Path:
         if folder.exists() and folder.is_dir():
             return folder
     return DB_KARYAWAN_DIR / name_slug
+
+
+def _check_models_on_startup() -> None:
+    """Verify critical models exist; warn if missing (non-blocking)."""
+    import logging
+    
+    logger = logging.getLogger("uvicorn.error")
+    home = Path.home()
+    face_model = _face_model_name()
+    insightface_path = home / ".insightface" / "models" / face_model
+    
+    # Check InsightFace model
+    if not insightface_path.exists() or not any(insightface_path.glob("*.onnx")):
+        logger.warning(
+            f"⚠️  InsightFace model '{face_model}' not found at {insightface_path}. "
+            f"It will be downloaded (~140-250 MB) on first camera start. "
+            f"To pre-download: python setup_models.py"
+        )
+    
+    # Check YOLO model
+    yolo_model = os.getenv("YOLO_MODEL", "yolov8n.pt").strip()
+    yolo_path = Path(yolo_model)
+    if not yolo_path.exists() and not yolo_path.is_absolute():
+        # Try in current directory
+        yolo_path = Path.cwd() / yolo_model
+    
+    if not yolo_path.exists():
+        logger.warning(
+            f"⚠️  YOLO model '{yolo_model}' not found. "
+            f"It will be downloaded (~6 MB) on first camera start. "
+            f"To pre-download: python setup_models.py"
+        )
 
 
 def _list_folder_photos(folder: Path) -> list[Path]:
