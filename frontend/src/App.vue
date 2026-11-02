@@ -312,7 +312,7 @@ const showReviewed = ref(false)
 const reviewedVisitors = ref([])
 const customerReview = ref({ open: false, customer: null, reason: '', note: '', busy: false, error: '' })
 const reviewReasons = [
-  ['not_person', 'Bukan orang'], ['bad_crop', 'Crop salah'], ['object', 'Tangan / jam / objek'],
+  ['not_person', 'Bukan orang'], ['no_image', 'Tidak menangkap gambar'], ['bad_crop', 'Crop salah'], ['object', 'Tangan / jam / objek'],
   ['blur', 'Foto blur'], ['duplicate', 'Duplikat customer'], ['employee', 'Salah klasifikasi karyawan'], ['other', 'Lainnya'],
 ]
 

@@ -323,7 +323,7 @@ class LoginBody(BaseModel):
 
 
 class VisitorReviewBody(BaseModel):
-    reason_code: Literal["not_person", "bad_crop", "object", "blur", "duplicate", "employee", "other"]
+    reason_code: Literal["not_person", "no_image", "bad_crop", "object", "blur", "duplicate", "employee", "other"]
     note: str | None = Field(default=None, max_length=500)
 
 
