@@ -62,7 +62,9 @@ VISION_AI_TIMEOUT_SECONDS = min(300, max(120, int(os.getenv("VISION_AI_TIMEOUT_S
 
 
 def _face_model_name() -> str:
-    return os.getenv("FACE_MODEL", "buffalo_l").strip() or "buffalo_l"
+    from sface_recognizer import resolve_face_model_name
+
+    return resolve_face_model_name(os.getenv("FACE_MODEL", "sface"))
 
 
 def _face_allowed_modules() -> list[str] | None:
@@ -229,33 +231,33 @@ def _resolve_employee_folder(employee_code: str, employee_name: str) -> Path:
 
 
 def _check_models_on_startup() -> None:
-    """Verify critical models exist; warn if missing (non-blocking)."""
+    """Verify critical Apache-2.0 models exist; warn if missing (non-blocking)."""
     import logging
-    
+
     logger = logging.getLogger("uvicorn.error")
-    home = Path.home()
-    face_model = _face_model_name()
-    insightface_path = home / ".insightface" / "models" / face_model
-    
-    # Check InsightFace model
-    if not insightface_path.exists() or not any(insightface_path.glob("*.onnx")):
-        logger.warning(
-            f"⚠️  InsightFace model '{face_model}' not found at {insightface_path}. "
-            f"It will be downloaded (~140-250 MB) on first camera start. "
-            f"To pre-download: python setup_models.py"
-        )
-    
-    # Check YOLO model
-    yolo_model = os.getenv("YOLO_MODEL", "yolov8n.pt").strip()
+    from sface_recognizer import SFACE_ONNX_FILENAME, YUNET_ONNX_FILENAME
+
+    for fname in (YUNET_ONNX_FILENAME, SFACE_ONNX_FILENAME):
+        fpath = Path.cwd() / fname
+        if not fpath.exists():
+            logger.warning(
+                f"⚠️  OpenCV Zoo model '{fname}' not found at {fpath}. "
+                f"It will be downloaded (~37 MB, Apache-2.0) on first camera start. "
+                f"To pre-download: python setup_models.py"
+            )
+
+    # Check YOLOX ONNX model (Apache-2.0)
+    from yolox_detector import resolve_yolox_model_name
+
+    yolo_model = resolve_yolox_model_name(os.getenv("YOLO_MODEL", "yolox_nano.onnx"))
     yolo_path = Path(yolo_model)
     if not yolo_path.exists() and not yolo_path.is_absolute():
-        # Try in current directory
         yolo_path = Path.cwd() / yolo_model
-    
+
     if not yolo_path.exists():
         logger.warning(
-            f"⚠️  YOLO model '{yolo_model}' not found. "
-            f"It will be downloaded (~6 MB) on first camera start. "
+            f"⚠️  YOLOX model '{yolo_model}' not found. "
+            f"It will be downloaded (~3.6 MB, Apache-2.0) on first camera start. "
             f"To pre-download: python setup_models.py"
         )
 
@@ -271,7 +273,7 @@ def _list_folder_photos(folder: Path) -> list[Path]:
 def _get_face_analyzer():
     global _face_analyzer
     if _face_analyzer is None:
-        from insightface.app import FaceAnalysis
+        from sface_recognizer import FaceAnalysis
 
         analyzer = FaceAnalysis(
             name=_face_model_name(), providers=["CPUExecutionProvider"], allowed_modules=_face_allowed_modules()

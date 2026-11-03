@@ -1,6 +1,6 @@
 # StaffLens AI
 
-> Hybrid CCTV & Webcam Analytics untuk **Penghitungan Customer Unik Harian (*Unique Daily Customer Counting*)** dan **Pemantauan Kehadiran Staf (*Active Staff Presence*)**: **YOLOv8 + Supervision/ByteTrack** untuk deteksi dan pelacakan orang, dipadukan dengan **InsightFace (`buffalo_l`)**, **HSV Body Appearance Re-ID**, **Smart Fallback Vision AI**, **PostgreSQL**, serta **Dashboard Web Lokal (FastAPI + Vue 3)**.
+> Hybrid CCTV & Webcam Analytics untuk **Penghitungan Customer Unik Harian (*Unique Daily Customer Counting*)** dan **Pemantauan Kehadiran Staf (*Active Staff Presence*)**: **YOLOX (Apache-2.0) + Supervision/ByteTrack** untuk deteksi dan pelacakan orang, dipadukan dengan **OpenCV Zoo YuNet + SFace (`sface`, Apache-2.0)**, **HSV Body Appearance Re-ID**, **Smart Fallback Vision AI**, **PostgreSQL (`pg8000`, BSD-3-Clause)**, serta **Dashboard Web Lokal (FastAPI + Vue 3)**.
 
 ---
 
@@ -11,7 +11,7 @@ StaffLens AI dirancang untuk menjawab dua kebutuhan operasional utama di lokasi 
 2. **Menghitung Karyawan yang Hadir / Aktif & Mengecualikannya dari Customer:** Karyawan yang sudah didaftarkan wajahnya dihitung pada metrik **Karyawan Hadir Hari Ini** dan **tidak pernah dihitung sebagai customer**.
 
 ### Kapabilitas Inti (`app.py` + `server.py`)
-- **Deteksi & Tracking (`YOLOv8n` + `ByteTrack`):** Mendeteksi orang (`COCO class 0`) di setiap frame dan menjaga `track_id` tetap stabil.
+- **Deteksi & Tracking (`YOLOX-Nano ONNX` + `ByteTrack`):** Mendeteksi orang (`COCO class 0`) secara bebas lisensi komersial (**Apache-2.0**) di setiap frame dan menjaga `track_id` tetap stabil.
 - **3 Lapis Deduplikasi Pengunjung Harian (*Ephemeral Daily Visitor Memory*):**
   1. **Auto-Enroll Wajah Pengunjung Harian (`face_vector`):** Pengunjung yang wajahnya terlihat (dan bukan karyawan) disimpan vektor wajah 512-D-nya ke tabel `daily_visitors` untuk tanggal hari tersebut. Jika ia datang lagi di hari yang sama, wajahnya dikenali sehingga tidak dihitung ganda.
   2. **Body Appearance Signature (`body_vector`):** Untuk pengunjung atau staf yang tidak terlihat jelas wajahnya, sistem mengekstrak *signature* warna dan kontras pakaian atas/bawah (*HSV Torso Histogram*). Ini mencegah orang yang sama dihitung 2 kali saat kembali ke area kamera di hari yang sama.
@@ -31,9 +31,9 @@ Webcam (Indeks 0..8) / RTSP / Video File
    [Auto-refresh data pegawai & daily_visitors dari PostgreSQL]
           │
           ▼
-   YOLOv8 Person Detection (class=0) + Supervision ByteTrack (track_id)
+   YOLOX Person Detection (class=0, Apache-2.0) + Supervision ByteTrack (track_id)
           │
-          ├── 1. Cek Wajah Selektif (InsightFace buffalo_l 512-D)
+          ├── 1. Cek Wajah Selektif (OpenCV Zoo YuNet + SFace 128-D, Apache-2.0)
           │        ├── Cocok dengan DB Karyawan (>= 0.45)
           │        │     └──► Kunci sebagai KARYAWAN (Kotak Hijau)
           │        │          + Catat kehadiran staf hari ini
@@ -59,9 +59,9 @@ Webcam (Indeks 0..8) / RTSP / Video File
 ## Penjelasan Flow Foto Lokal (`db_karyawan/`) vs Vector Embedding PostgreSQL
 
 1. **Apakah Ada Proses "Training Model" Saat Mendaftarkan Foto?**
-   - **Tidak ada retraining.** Model `InsightFace (buffalo_l)` adalah model *pre-trained* (*Zero-Shot Metric Learning*). Saat Anda menjalankan `register_employee.py`, foto wajah pegawai diubah menjadi **512 angka desimal (vektor 512-dimensi)** dan disimpan ke kolom `vector` (`JSONB`) pada tabel `face_embeddings` di PostgreSQL.
+   - **Tidak ada retraining.** Model `OpenCV Zoo YuNet + SFace (sface, Apache-2.0)` adalah model *pre-trained* (*Zero-Shot Metric Learning*). Saat Anda menjalankan `register_employee.py`, foto wajah pegawai diubah menjadi **128 angka desimal (vektor 128-dimensi)** dan disimpan ke kolom `vector` (`JSONB`) pada tabel `face_embeddings` di PostgreSQL.
 2. **Apakah Foto di `db_karyawan/` Masih Dibutuhkan Setelah Masuk PostgreSQL?**
-   - Saat kamera berjalan (`app.py` / `server.py`), aplikasi **hanya membaca vektor 512 angka dari PostgreSQL** dan **tidak membaca folder `db_karyawan/` sama sekali**.
+   - Saat kamera berjalan (`app.py` / `server.py`), aplikasi **hanya membaca vektor 128 angka dari PostgreSQL** dan **tidak membaca folder `db_karyawan/` sama sekali**.
    - Namun, disarankan tetap menyimpan cadangan foto asli (di folder lokal yang di-ignore Git atau di S3 privat) apabila suatu saat Anda ingin menambah foto baru untuk pegawai tersebut atau mengganti jenis model `FACE_MODEL` di `.env`.
 
 ---
@@ -73,10 +73,13 @@ qderma-stafflens-ai/
 ├── app.py                  # Pipeline utama CV/AI: deteksi, deduplikasi customer harian, & kehadiran staf
 ├── server.py               # Backend FastAPI, API metrik harian (/api/overview, /api/visitors), & MJPEG stream
 ├── database.py             # Model SQLAlchemy (Employee, FaceEmbedding, DailyVisitor, CameraEvent, CameraSettings)
-├── register_employee.py    # CLI ekstraksi foto wajah pegawai menjadi vektor 512-D di PostgreSQL
-├── requirements.txt        # Daftar dependensi Python
+├── register_employee.py    # CLI ekstraksi foto wajah pegawai menjadi vektor 128-D di PostgreSQL
+├── requirements.txt        # Daftar dependensi Python (100% lisensi bebas komersial: Apache-2.0 / MIT / BSD)
 ├── .env.example            # Template konfigurasi environment (DB, Performa, Deduplikasi, & Vision AI)
-├── yolov8n.pt              # Bobot model dasar YOLOv8 Nano (COCO)
+├── yolox_detector.py       # Mesin inferensi YOLOX ONNX Runtime (Apache-2.0)
+├── sface_recognizer.py     # Mesin deteksi & pengenalan wajah OpenCV Zoo YuNet + SFace (Apache-2.0)
+├── third_party/yolox/      # Modul sumber YOLOX (Megvii-BaseDetection/YOLOX, Apache-2.0)
+├── third_party/opencv_zoo/ # Modul sumber OpenCV Zoo YuNet + SFace (opencv/opencv_zoo, Apache-2.0)
 ├── db_karyawan/            # Folder lokal foto referensi pegawai (diabaikan oleh Git)
 ├── db_customer/             # Maks. 10 snapshot crop terbaik per ID customer harian (diabaikan oleh Git)
 ├── frontend/               # Aplikasi SPA Dashboard (Vue 3 + Vite)

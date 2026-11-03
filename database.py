@@ -13,7 +13,17 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship,
 
 load_dotenv()
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+
+def _normalize_database_url(raw_url: str) -> str:
+    """Use BSD-3-Clause pg8000 driver for PostgreSQL URLs."""
+    url = raw_url.strip()
+    for prefix in ("postgresql+psycopg://", "postgresql+psycopg2://", "postgresql://", "postgres://"):
+        if url.startswith(prefix):
+            return "postgresql+pg8000://" + url[len(prefix) :]
+    return url
+
+
+DATABASE_URL = _normalize_database_url(os.environ["DATABASE_URL"])
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
@@ -44,7 +54,7 @@ class FaceEmbedding(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="CASCADE"), index=True)
-    model_name: Mapped[str] = mapped_column(String(100), default="buffalo_l")
+    model_name: Mapped[str] = mapped_column(String(100), default="sface")
     vector: Mapped[list[float]] = mapped_column(JSONB)
     quality_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

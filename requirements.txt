@@ -1,17 +1,16 @@
-# Core hybrid CV pipeline
-ultralytics
-supervision==0.25.1
-insightface
+# Core hybrid CV pipeline (100% commercial-free: Apache-2.0 YOLOX + Apache-2.0 OpenCV YuNet/SFace + MIT Supervision/ONNXRuntime)
+onnx
 onnxruntime
+supervision==0.25.1
 opencv-python==4.10.0.84
 numpy>=1.26,<2
 ml-dtypes>=0.5,<0.6
 python-dateutil>=2.9,<3
 
-# Configuration and persistence
+# Configuration and persistence (100% commercial-free: BSD-3-Clause pg8000 + MIT PyMySQL/SQLAlchemy/FastAPI)
 python-dotenv
 SQLAlchemy
-psycopg[binary]
+pg8000
 PyMySQL
 fastapi
 uvicorn[standard]

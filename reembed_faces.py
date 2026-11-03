@@ -1,7 +1,6 @@
-"""Re-generate employee face embeddings for one InsightFace model from photos in db_karyawan/.
+"""Re-generate employee face embeddings for OpenCV Zoo SFace (Apache-2.0) from photos in db_karyawan/.
 
-Only rows with model_name == --model are replaced; embeddings of other models are kept,
-so switching FACE_MODEL back (e.g. buffalo_s -> buffalo_l) needs no re-registration.
+Only rows with model_name == --model are replaced; embeddings of other models are kept.
 See docs/OPTIMASI_PERFORMA.md.
 """
 
@@ -11,14 +10,15 @@ import argparse
 import os
 
 from dotenv import load_dotenv
+from sface_recognizer import resolve_face_model_name
 
 
 def main() -> None:
     load_dotenv()
-    parser = argparse.ArgumentParser(description="Re-embed employee faces for a given InsightFace model.")
-    parser.add_argument("--model", default=None, help="InsightFace model pack (default: FACE_MODEL from .env)")
+    parser = argparse.ArgumentParser(description="Re-embed employee faces for a given face recognition model.")
+    parser.add_argument("--model", default=None, help="Face recognition model (default: FACE_MODEL from .env or 'sface')")
     args = parser.parse_args()
-    model = (args.model or os.getenv("FACE_MODEL", "buffalo_l")).strip()
+    model = resolve_face_model_name(args.model or os.getenv("FACE_MODEL", "sface"))
     os.environ["FACE_MODEL"] = model  # server helpers read FACE_MODEL at call time
 
     from database import Employee, FaceEmbedding, SessionLocal, initialize_database

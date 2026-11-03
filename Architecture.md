@@ -6,7 +6,7 @@ Kamera/inference **tidak pernah menunggu Vision AI**. Vision AI hanya fallback a
 
 ```text
 camera frame
-  -> YOLO person detection
+  -> YOLOX (Apache-2.0) person detection
   -> ByteTrack
   -> snapshot terbaik ke customer_snapshots/temp
   -> local face/body analysis
@@ -43,14 +43,14 @@ camera frame
 
 ## Model
 
-- Produksi: `FACE_MODEL=buffalo_l`.
-- Embedding `buffalo_s` dan `buffalo_l` tidak kompatibel secara operasional; setelah ganti model, re-embed seluruh foto pegawai.
-- YOLO detection bukan keputusan customer. Tangan/jam/krop kecil wajib ditolak lewat filter ukuran, confidence, aspect ratio, serta konfirmasi beberapa frame.
+- Produksi: `FACE_MODEL=sface` (OpenCV Zoo YuNet + SFace, Apache-2.0, 128-D embedding).
+- Setelah mengganti model wajah, jalankan `python reembed_faces.py` untuk memperbarui embedding seluruh foto pegawai.
+- YOLOX detection (`yolox_nano.onnx`, Apache-2.0) bukan keputusan customer. Tangan/jam/krop kecil wajib ditolak lewat filter ukuran, confidence, aspect ratio, serta konfirmasi beberapa frame.
 
 ## Konfigurasi baseline
 
 ```env
-FACE_MODEL=buffalo_l
+FACE_MODEL=sface
 CUSTOMER_MIN_DWELL_SECONDS=2.5
 VISION_AI_TIMEOUT_SECONDS=30
 CUSTOMER_SNAPSHOT_DIR=customer_snapshots/temp

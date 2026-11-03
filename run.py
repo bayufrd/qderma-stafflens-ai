@@ -80,19 +80,19 @@ def download_models(venv_python: str):
         print("   Models will be downloaded automatically on first use")
         return
     
-    # Check if models already exist
-    home = Path.home()
-    buffalo_s = home / ".insightface" / "models" / "buffalo_s"
-    yolo_onnx = Path("yolov8n.onnx")
+    # Check if Apache-2.0 ONNX models already exist
+    yunet_onnx = Path("face_detection_yunet_2023mar.onnx")
+    sface_onnx = Path("face_recognition_sface_2021dec.onnx")
+    yolo_onnx = Path("yolox_nano.onnx")
     
-    if buffalo_s.exists() and yolo_onnx.exists():
-        print("✓ AI models already downloaded")
+    if yunet_onnx.exists() and sface_onnx.exists() and yolo_onnx.exists():
+        print("✓ AI models already downloaded (Apache-2.0)")
         return
     
-    print("⬇ Downloading AI models (~400 MB, may take 5-10 minutes)...")
+    print("⬇ Downloading AI models (~41 MB, Apache-2.0)...")
     exit_code = run_command(
         [venv_python, "setup_models.py"],
-        "Downloading InsightFace and YOLO models",
+        "Downloading OpenCV Zoo (YuNet + SFace) and YOLOX models",
         check=False
     )
     

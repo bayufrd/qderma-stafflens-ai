@@ -9,9 +9,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 from dotenv import load_dotenv
-from insightface.app import FaceAnalysis
 
 from database import Employee, FaceEmbedding, SessionLocal, initialize_database
+from sface_recognizer import FaceAnalysis, resolve_face_model_name
 
 load_dotenv()
 
@@ -28,7 +28,7 @@ def main() -> None:
     if not photos:
         raise SystemExit("No .jpg/.jpeg/.png photos found.")
 
-    face_model = os.getenv("FACE_MODEL", "buffalo_l").strip() or "buffalo_l"
+    face_model = resolve_face_model_name(os.getenv("FACE_MODEL", "sface"))
     face_app = FaceAnalysis(
         name=face_model, providers=["CPUExecutionProvider"], allowed_modules=["detection", "recognition"]
     )

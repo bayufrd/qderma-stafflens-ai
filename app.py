@@ -15,26 +15,24 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-warnings.filterwarnings("ignore", category=FutureWarning, module=r"insightface\..*")
-
 import cv2
 import numpy as np
 import requests
 import supervision as sv
 from dotenv import load_dotenv
-from insightface.app import FaceAnalysis
 from sqlalchemy import func, select
-from ultralytics import YOLO
 
 from database import CameraEvent, DailyVisitor, Employee, FaceEmbedding, SessionLocal, initialize_database
+from sface_recognizer import FaceAnalysis, resolve_face_model_name
+from yolox_detector import YOLOXDetector, resolve_yolox_model_name
 
 load_dotenv()
 
 CAMERA_ID = os.getenv("CAMERA_ID", "local-webcam-01")
 VIDEO_SOURCE = os.getenv("VIDEO_SOURCE", "0")
-YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8n.pt")
+YOLO_MODEL = resolve_yolox_model_name(os.getenv("YOLO_MODEL", "yolox_nano.onnx"))
 YOLO_CONFIDENCE = float(os.getenv("YOLO_CONFIDENCE", "0.40"))
-FACE_MODEL = os.getenv("FACE_MODEL", "buffalo_l")
+FACE_MODEL = resolve_face_model_name(os.getenv("FACE_MODEL", "sface"))
 MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.45"))
 GRAY_ZONE_THRESHOLD = float(os.getenv("FACE_GRAY_ZONE_THRESHOLD", "0.30"))
 VISITOR_FACE_THRESHOLD = float(os.getenv("VISITOR_FACE_THRESHOLD", "0.40"))
@@ -163,16 +161,10 @@ DB_ASYNC_WRITES = _env_flag("DB_ASYNC_WRITES", "1")
 _vision_semaphore = threading.Semaphore(1)
 
 
-def load_yolo_model() -> tuple[YOLO, str]:
-    """D8: load YOLO_MODEL; if an exported .onnx file is missing, fall back to the matching .pt weights."""
-    path = YOLO_MODEL
-    if path.lower().endswith(".onnx") and not os.path.exists(path):
-        fallback = path[: -len(".onnx")] + ".pt"
-        print(f"YOLO model {path} not found; falling back to {fallback}. See docs/OPTIMASI_PERFORMA.md section 4.")
-        path = fallback
-    if path.lower().endswith(".onnx"):
-        return YOLO(path, task="detect"), path
-    return YOLO(path), path
+def load_yolo_model() -> tuple[YOLOXDetector, str]:
+    """Load Apache-2.0 YOLOX ONNX model via ONNX Runtime (auto-downloading yolox_nano.onnx if missing)."""
+    detector = YOLOXDetector(model_path=YOLO_MODEL, providers=PROVIDERS)
+    return detector, str(detector.onnx_path)
 
 
 class LatestFrameReader:
@@ -744,15 +736,11 @@ def main(
     )
 
     model, yolo_path = load_yolo_model()
-    yolo_device = YOLO_DEVICE
-    if yolo_device == "mps" and yolo_path.lower().endswith(".onnx"):
-        yolo_device = "cpu"
-    yolo_kwargs: dict[str, object] = {"device": yolo_device} if yolo_device else {}
     tracker = sv.ByteTrack()
     face_app = FaceAnalysis(name=FACE_MODEL, providers=PROVIDERS, allowed_modules=FACE_ALLOWED_MODULES)
     face_app.prepare(ctx_id=0, det_size=(face_size, face_size))
     print(
-        f"Runtime: YOLO={yolo_path} device={yolo_device or 'default'} | FACE_MODEL={FACE_MODEL} "
+        f"Runtime: YOLOX={yolo_path} providers={model.session.get_providers()} | FACE_MODEL={FACE_MODEL} "
         f"modules={sorted(face_app.models)} providers={PROVIDERS} | threaded_capture={CAMERA_THREADED} "
         f"async_db={DB_ASYNC_WRITES}"
     )
@@ -881,8 +869,8 @@ def main(
                 if now - float(stale_entry.get("last_seen", now)) > CACHE_TTL:
                     cache.pop(stale_id, None)
 
-            result = model(frame, classes=[0], conf=YOLO_CONFIDENCE, imgsz=imgsz, verbose=False, **yolo_kwargs)[0]
-            detections = tracker.update_with_detections(sv.Detections.from_ultralytics(result))
+            raw_detections = model.detect_detections(frame, classes=[0], conf=YOLO_CONFIDENCE, imgsz=imgsz)
+            detections = tracker.update_with_detections(raw_detections)
             face_checked = False
 
             live_staff = 0

@@ -1,97 +1,64 @@
-"""Pre-download InsightFace models and export YOLO ONNX before running the app."""
+"""Pre-download Apache-2.0 OpenCV Zoo (YuNet + SFace) and YOLOX ONNX models before running the app."""
 
 import os
 import sys
-from pathlib import Path
 
 
-def check_and_download_face_models():
-    """Download InsightFace models if not present."""
+def check_and_download_face_models() -> bool:
+    """Download Apache-2.0 YuNet and SFace ONNX models if not present."""
     print("=" * 60)
-    print("Checking InsightFace models...")
+    print("Checking OpenCV Zoo YuNet + SFace models (Apache-2.0)...")
     print("=" * 60)
-    
+
     try:
-        from insightface.app import FaceAnalysis
-    except ImportError:
-        print("❌ insightface not installed. Run: pip install -r requirements.txt")
+        from sface_recognizer import ensure_opencv_face_models
+    except ImportError as e:
+        print(f"❌ Failed to import sface_recognizer: {e}")
         return False
-    
-    models = ["buffalo_l", "buffalo_s"]
-    home = Path.home()
-    insightface_root = home / ".insightface" / "models"
-    
-    for model_name in models:
-        model_path = insightface_root / model_name
-        if model_path.exists() and any(model_path.glob("*.onnx")):
-            print(f"✓ {model_name} already downloaded at {model_path}")
-        else:
-            print(f"⬇ Downloading {model_name} (~140-250 MB)...")
-            try:
-                # Trigger download by creating analyzer
-                FaceAnalysis(name=model_name, providers=["CPUExecutionProvider"])
-                print(f"✓ {model_name} downloaded successfully")
-            except Exception as e:
-                print(f"❌ Failed to download {model_name}: {e}")
-                return False
-    
-    print(f"\n✓ All InsightFace models ready at {insightface_root}")
-    return True
 
-
-def check_and_export_yolo_onnx():
-    """Export YOLO model to ONNX if not present."""
-    print("\n" + "=" * 60)
-    print("Checking YOLO ONNX model...")
-    print("=" * 60)
-    
     try:
-        from ultralytics import YOLO
-    except ImportError:
-        print("❌ ultralytics not installed. Run: pip install -r requirements.txt")
-        return False
-    
-    pt_path = Path("yolov8n.pt")
-    onnx_path = Path("yolov8n.onnx")
-    
-    if onnx_path.exists():
-        print(f"✓ yolov8n.onnx already exists ({onnx_path.stat().st_size / 1024 / 1024:.1f} MB)")
-        return True
-    
-    if not pt_path.exists():
-        print(f"⬇ Downloading yolov8n.pt (~6 MB)...")
-        try:
-            # YOLO will auto-download if model doesn't exist
-            model = YOLO("yolov8n.pt")
-        except Exception as e:
-            print(f"❌ Failed to download yolov8n.pt: {e}")
-            return False
-    
-    print(f"🔧 Exporting yolov8n.pt to ONNX format...")
-    try:
-        model = YOLO("yolov8n.pt")
-        model.export(format="onnx", dynamic=True, simplify=False)
-        print(f"✓ yolov8n.onnx exported successfully ({onnx_path.stat().st_size / 1024 / 1024:.1f} MB)")
+        yunet_path, sface_path = ensure_opencv_face_models()
+        print(f"✓ {yunet_path.name} ready ({yunet_path.stat().st_size / 1024:.0f} KB, Apache-2.0)")
+        print(f"✓ {sface_path.name} ready ({sface_path.stat().st_size / 1024 / 1024:.1f} MB, Apache-2.0)")
         return True
     except Exception as e:
-        print(f"❌ Failed to export ONNX: {e}")
+        print(f"❌ Failed to prepare OpenCV Zoo face models: {e}")
         return False
 
 
-def main():
+def check_and_download_yolox_onnx() -> bool:
+    """Download Apache-2.0 YOLOX ONNX model if not present."""
+    print("\n" + "=" * 60)
+    print("Checking YOLOX ONNX model (Apache-2.0)...")
+    print("=" * 60)
+
+    try:
+        from yolox_detector import ensure_yolox_onnx, resolve_yolox_model_name
+    except ImportError as e:
+        print(f"❌ Failed to import yolox_detector: {e}")
+        return False
+
+    model_name = resolve_yolox_model_name(os.getenv("YOLO_MODEL", "yolox_nano.onnx"))
+    try:
+        onnx_path = ensure_yolox_onnx(model_name)
+        print(f"✓ {onnx_path.name} ready ({onnx_path.stat().st_size / 1024 / 1024:.1f} MB, Apache-2.0)")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to prepare YOLOX ONNX model: {e}")
+        return False
+
+
+def main() -> int:
     """Check and download all required models."""
-    print("\n🚀 StaffLens AI - Model Setup")
-    print("This will download required models (~400 MB total)\n")
-    
-    # Check InsightFace models
+    print("\n🚀 StaffLens AI - Model Setup (100% Apache-2.0 Commercial-Free Models)")
+    print("This will verify/download YuNet, SFace, and YOLOX ONNX models (~41 MB total)\n")
+
     face_ok = check_and_download_face_models()
-    
-    # Check YOLO ONNX
-    yolo_ok = check_and_export_yolo_onnx()
-    
+    yolo_ok = check_and_download_yolox_onnx()
+
     print("\n" + "=" * 60)
     if face_ok and yolo_ok:
-        print("✅ All models ready! You can now run:")
+        print("✅ All Apache-2.0 models ready! You can now run:")
         print("   python server.py")
         print("   python app.py")
         print("=" * 60)
