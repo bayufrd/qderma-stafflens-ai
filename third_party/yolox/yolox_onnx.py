@@ -207,7 +207,10 @@ class YOLOXDetector:
         default_imgsz: int = 416,
     ) -> None:
         self.onnx_path = ensure_yolox_onnx(model_path)
-        self.providers = list(providers) if providers else ["CPUExecutionProvider"]
+        raw_providers = list(providers) if providers else ["CPUExecutionProvider"]
+        # Drop CoreMLExecutionProvider for YOLOX as 1 unsupported node causes slow graph partitioning
+        filtered_providers = [p for p in raw_providers if p != "CoreMLExecutionProvider"]
+        self.providers = filtered_providers or ["CPUExecutionProvider"]
         self.nms_thresh = nms_thresh
         self._sessions: dict[tuple[int, int], ort.InferenceSession] = {}
         self._base_proto = None

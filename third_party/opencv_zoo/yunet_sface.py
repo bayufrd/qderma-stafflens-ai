@@ -92,7 +92,7 @@ class SFaceAnalyzer:
         name: str = DEFAULT_FACE_MODEL,
         providers: Sequence[str] | None = None,
         allowed_modules: Sequence[str] | None = None,
-        score_threshold: float = 0.60,
+        score_threshold: float = 0.80,
         nms_threshold: float = 0.30,
         top_k: int = 5000,
     ) -> None:
